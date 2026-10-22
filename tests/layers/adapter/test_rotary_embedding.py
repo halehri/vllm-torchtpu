@@ -17,7 +17,11 @@ import pytest
 import torch
 from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.custom_op import op_registry_oot
+from vllm.model_executor.layers import rotary_embedding as upstream_rope
 from vllm.model_executor.layers.rotary_embedding import (
+    DynamicNTKScalingRotaryEmbedding,
+    FourierRotaryEmbedding,
+    Llama3RotaryEmbedding,
     MRotaryEmbedding,
     RotaryEmbedding,
     YaRNScalingRotaryEmbedding,
@@ -32,8 +36,11 @@ MAX_POS = 4096
 
 
 @pytest.fixture(autouse=True)
-def _vllm_config():
+def _vllm_config(monkeypatch):
     # CustomOp.__init__ reads the compilation config to pick its forward.
+    # get_rope memoizes instances in _ROPE_DICT; an entry built by an earlier
+    # test (before this module registered the OOT classes) must not leak in.
+    monkeypatch.setattr(upstream_rope, "_ROPE_DICT", {})
     with set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device="cpu"))):
         yield
 
@@ -58,6 +65,35 @@ def test_oot_classes_registered():
         assert cls.__name__ == f"Tpu{name}"
     assert "RotaryEmbedding" in tpu_rope.TPU_ROPE_CLASSES
     assert "YaRNScalingRotaryEmbedding" in tpu_rope.TPU_ROPE_CLASSES
+
+
+def test_discovery_covers_every_static_path_subclass():
+    """Every upstream RotaryEmbedding subclass that still runs
+    RotaryEmbedding.forward_static must have a TPU override; classes with
+    their own forward_native must not (they are served via TpuApplyRotaryEmb
+    or need a dedicated override)."""
+    covered = set(tpu_rope.TPU_ROPE_CLASSES)
+    for cls in (Llama3RotaryEmbedding, DynamicNTKScalingRotaryEmbedding):
+        assert "forward_native" not in cls.__dict__
+        assert cls.__name__ in covered
+    for cls in (MRotaryEmbedding, FourierRotaryEmbedding):
+        assert "forward_native" in cls.__dict__
+        assert cls.__name__ not in covered
+    # No upstream subclass slipped through.
+    for cls in tpu_rope._all_subclasses(RotaryEmbedding):
+        is_upstream = cls.__module__.startswith("vllm.")
+        if is_upstream and tpu_rope._uses_static_rotary_forward(cls):
+            assert cls.__name__ in covered, cls
+
+
+def test_apply_rotary_emb_forces_fp32_for_positional_and_keyword_args():
+    assert ApplyRotaryEmb().enable_fp32_compute is True
+    kw = ApplyRotaryEmb(is_neox_style=False, enable_fp32_compute=False)
+    assert kw.enable_fp32_compute is True
+    # upstream signature: (enforce_enable, is_neox_style, enable_fp32_compute)
+    emb = ApplyRotaryEmb(False, False, False)
+    assert emb.enable_fp32_compute is True
+    assert emb.is_neox_style is False
 
 
 def test_upstream_constructors_yield_tpu_classes():

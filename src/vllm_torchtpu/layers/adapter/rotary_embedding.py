@@ -30,8 +30,9 @@ upstream class name, so each upstream class that needs the fix gets one entry:
 * ``ApplyRotaryEmb``: constructed with ``enable_fp32_compute=True``. Covers
   every caller that goes through an instance, in particular
   ``MRotaryEmbedding`` (Qwen3.5 / Qwen3-VL) and its subclasses.
-* ``RotaryEmbedding`` and the subclasses that inherit its ``forward_native``
-  (Llama3, YaRN, NTK, linear, Gemma4 scaling): ``forward_static`` calls
+* ``RotaryEmbedding`` and every upstream subclass that inherits its
+  ``forward_native`` (Llama3, YaRN, NTK, linear, Gemma4 scaling, ...; found by
+  walking the class hierarchy): ``forward_static`` calls
   ``ApplyRotaryEmb.forward_static`` directly, so the instance flag does not
   reach it. The TPU subclass replays ``forward_static`` with
   ``enable_fp32_compute=True``.
@@ -42,17 +43,9 @@ CUDA runs the FP32 kernel in both cases, and so should TPU.
 """
 
 import torch
-from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.rotary_embedding import (
-    DynamicNTKAlphaRotaryEmbedding,
-    DynamicNTKScalingRotaryEmbedding,
-    Gemma4RotaryEmbedding,
-    LinearScalingRotaryEmbedding,
-    Llama3RotaryEmbedding,
-    NTKScalingRotaryEmbedding,
-    RotaryEmbedding,
-    YaRNScalingRotaryEmbedding,
-)
+from vllm.model_executor.custom_op import CustomOp, op_registry_oot
+from vllm.model_executor.layers import rotary_embedding as upstream_rope
+from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 
 from vllm_torchtpu.logger import init_logger
@@ -64,9 +57,22 @@ logger = init_logger(__name__)
 class TpuApplyRotaryEmb(ApplyRotaryEmb):
     """``ApplyRotaryEmb`` that always rotates in FP32, like the CUDA kernel."""
 
-    def __init__(self, *args, **kwargs) -> None:
-        kwargs["enable_fp32_compute"] = True
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        enforce_enable: bool = False,
+        is_neox_style: bool = True,
+        enable_fp32_compute: bool = False,
+        **kwargs,
+    ) -> None:
+        # Mirror the upstream positional signature so callers passing
+        # enable_fp32_compute positionally are overridden too, not rejected.
+        del enable_fp32_compute  # always FP32 on TPU
+        super().__init__(
+            enforce_enable=enforce_enable,
+            is_neox_style=is_neox_style,
+            enable_fp32_compute=True,
+            **kwargs,
+        )
 
     def forward_oot(
         self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
@@ -115,24 +121,50 @@ def _rotary_forward_fp32(
     return query, key
 
 
-# Upstream RotaryEmbedding classes whose forward is RotaryEmbedding.forward_static.
-# Classes with their own forward_native (MRotaryEmbedding family, FoPE,
-# DeepSeek scaling) are not listed; the MRoPE family is covered through
-# TpuApplyRotaryEmb.
-_STATIC_ROPE_CLASSES: tuple[type[RotaryEmbedding], ...] = (
-    RotaryEmbedding,
-    DynamicNTKAlphaRotaryEmbedding,
-    DynamicNTKScalingRotaryEmbedding,
-    Gemma4RotaryEmbedding,
-    Llama3RotaryEmbedding,
-    LinearScalingRotaryEmbedding,
-    NTKScalingRotaryEmbedding,
-    YaRNScalingRotaryEmbedding,
-)
+def _all_subclasses(cls: type) -> set[type]:
+    out: set[type] = set()
+    for sub in cls.__subclasses__():
+        out.add(sub)
+        out |= _all_subclasses(sub)
+    return out
+
+
+def _uses_static_rotary_forward(cls: type[RotaryEmbedding]) -> bool:
+    """True if ``cls.forward_native`` resolves to ``RotaryEmbedding``'s.
+
+    Classes with their own forward_native (MRotaryEmbedding family, FoPE,
+    DeepSeek scaling, ...) do not run the static path; the MRoPE family is
+    covered through TpuApplyRotaryEmb instead.
+    """
+    for c in cls.__mro__:
+        if "forward_native" in c.__dict__:
+            return c is RotaryEmbedding
+    return False
+
+
+def _discover_static_rope_classes() -> tuple[type[RotaryEmbedding], ...]:
+    """Upstream RotaryEmbedding classes whose forward is the static path.
+
+    Discovered from the class hierarchy (``vllm.model_executor.layers.
+    rotary_embedding`` imports every variant), so new upstream scaling
+    variants are picked up without editing this file.
+    """
+    upstream_prefix = upstream_rope.__name__ + "."
+    found = {
+        c
+        for c in _all_subclasses(RotaryEmbedding)
+        if c.__module__.startswith(upstream_prefix)
+        and _uses_static_rotary_forward(c)
+        and c.__name__ not in op_registry_oot
+    }
+    return (RotaryEmbedding, *sorted(found, key=lambda c: c.__name__))
+
+
+_STATIC_ROPE_CLASSES = _discover_static_rope_classes()
 
 
 def _make_tpu_rope_class(base: type[RotaryEmbedding]) -> type[RotaryEmbedding]:
-    assert "forward_native" not in base.__dict__ or base is RotaryEmbedding, (
+    assert _uses_static_rotary_forward(base), (
         f"{base.__name__} defines its own forward_native; it needs its own TPU "
         "override instead of the shared RotaryEmbedding.forward_static replay."
     )
