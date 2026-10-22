@@ -68,7 +68,7 @@ def test_platform_default_priority_prefers_tpu_then_native():
 
 def test_rms_norm_matches_cuda_reference(bf16_inputs):
     x, _, weight = bf16_inputs
-    out = ir_ops.rms_norm(x, weight, EPS)
+    out = ir_ops.rms_norm.impl_fn(x, weight, EPS)
     assert out.dtype == x.dtype
     torch.testing.assert_close(out, _cuda_rms_norm_reference(x, weight), rtol=0, atol=0)
 
@@ -78,7 +78,7 @@ def test_rms_norm_differs_from_native_rounding(bf16_inputs):
     weight multiply, so the two disagree on some elements."""
     x, _, weight = bf16_inputs
     native = ir.ops.rms_norm.impls["native"].impl_fn(x, weight, EPS)
-    tpu = ir_ops.rms_norm(x, weight, EPS)
+    tpu = ir_ops.rms_norm.impl_fn(x, weight, EPS)
     assert not torch.equal(native, tpu)
     # ...but both are the same function up to BF16 rounding.
     torch.testing.assert_close(native.float(), tpu.float(), rtol=2e-2, atol=2e-2)
@@ -86,7 +86,7 @@ def test_rms_norm_differs_from_native_rounding(bf16_inputs):
 
 def test_rms_norm_variance_size_and_no_weight():
     x = torch.randn(4, 16).to(torch.bfloat16)
-    out = ir_ops.rms_norm(x, None, EPS, variance_size=8)
+    out = ir_ops.rms_norm.impl_fn(x, None, EPS, variance_size=8)
     xf = x.float()
     s = torch.rsqrt(xf[..., :8].pow(2).mean(-1, keepdim=True) + EPS)
     torch.testing.assert_close(out, (xf * s).to(x.dtype), rtol=0, atol=0)
@@ -94,7 +94,7 @@ def test_rms_norm_variance_size_and_no_weight():
 
 def test_fused_add_rms_norm_matches_cuda_reference(bf16_inputs):
     x, residual, weight = bf16_inputs
-    out, new_residual = ir_ops.fused_add_rms_norm(x, residual, weight, EPS)
+    out, new_residual = ir_ops.fused_add_rms_norm.impl_fn(x, residual, weight, EPS)
     ref_out, ref_residual = _cuda_fused_add_reference(x, residual, weight)
     assert out.dtype == x.dtype and new_residual.dtype == x.dtype
     torch.testing.assert_close(new_residual, ref_residual, rtol=0, atol=0)
@@ -106,9 +106,9 @@ def test_fused_add_rms_norm_normalizes_the_rounded_residual(bf16_inputs):
     BF16 residual. Feeding the returned residual back through plain rms_norm
     must therefore reproduce the fused output exactly."""
     x, residual, weight = bf16_inputs
-    out, new_residual = ir_ops.fused_add_rms_norm(x, residual, weight, EPS)
+    out, new_residual = ir_ops.fused_add_rms_norm.impl_fn(x, residual, weight, EPS)
     torch.testing.assert_close(
-        out, ir_ops.rms_norm(new_residual, weight, EPS), rtol=0, atol=0
+        out, ir_ops.rms_norm.impl_fn(new_residual, weight, EPS), rtol=0, atol=0
     )
     native_out, _ = ir.ops.fused_add_rms_norm.impls["native"].impl_fn(
         x, residual, weight, EPS
