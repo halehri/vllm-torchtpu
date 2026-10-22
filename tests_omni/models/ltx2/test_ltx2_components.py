@@ -29,7 +29,6 @@ Total runtime on TPU v7x: ~33s (6 test items).
 
 import copy
 import os
-from collections.abc import Callable
 
 import pytest
 import torch
@@ -67,7 +66,6 @@ from .utils import (
     assert_all_loaded,
     assert_parity,
     metrics,
-    record,
 )
 
 pytestmark = [pytest.mark.omni]
@@ -141,7 +139,6 @@ ROPE_SHARED_KWARGS: dict[str, object] = {
 
 
 def _assert_rope_parity(
-    record_property: Callable[[str, object], None],
     kind: str,
     tpu_out: tuple[torch.Tensor, torch.Tensor],
     ref_out: tuple[torch.Tensor, torch.Tensor],
@@ -160,11 +157,6 @@ def _assert_rope_parity(
         "cos": metrics(tpu_cos, ref_cos),
         "sin": metrics(tpu_sin, ref_sin),
     }
-    record(
-        record_property,
-        f"rope-{kind}",
-        vs_cpu_f64=vs_f64,
-    )
     for name, tpu_tbl, ref_tbl in (
         ("cos", tpu_cos, ref_cos),
         ("sin", tpu_sin, ref_sin),
@@ -179,9 +171,7 @@ def _assert_rope_parity(
 
 
 @torch.no_grad()
-def test_ltx2_video_rope_on_tpu_matches_diffusers(
-    record_property: Callable[[str, object], None],
-) -> None:
+def test_ltx2_video_rope_on_tpu_matches_diffusers() -> None:
     """LTX2AudioVideoRotaryPosEmbed on TPU matches diffusers CPU for 3D video."""
     kwargs = {
         **ROPE_SHARED_KWARGS,
@@ -217,7 +207,6 @@ def test_ltx2_video_rope_on_tpu_matches_diffusers(
     ref_out = ref_rope(cpu_coords)
 
     _assert_rope_parity(
-        record_property,
         kind="video",
         tpu_out=tpu_out,
         ref_out=ref_out,
@@ -226,9 +215,7 @@ def test_ltx2_video_rope_on_tpu_matches_diffusers(
 
 
 @torch.no_grad()
-def test_ltx2_audio_rope_on_tpu_matches_diffusers(
-    record_property: Callable[[str, object], None],
-) -> None:
+def test_ltx2_audio_rope_on_tpu_matches_diffusers() -> None:
     """LTX2AudioVideoRotaryPosEmbed on TPU matches diffusers CPU for 1D audio."""
     kwargs = {
         **ROPE_SHARED_KWARGS,
@@ -254,7 +241,6 @@ def test_ltx2_audio_rope_on_tpu_matches_diffusers(
     ref_out = ref_rope(cpu_coords)
 
     _assert_rope_parity(
-        record_property,
         kind="audio",
         tpu_out=tpu_out,
         ref_out=ref_out,
@@ -419,7 +405,6 @@ def _variant_omni_kwargs(
 def test_ltx2_tiny_transformer_parity(
     variant: str,
     omni_ctx: None,
-    record_property: Callable[[str, object], None],
 ) -> None:
     """vllm-omni LTX2VideoTransformer3DModel on TPU matches diffusers on CPU."""
     torch.manual_seed(0)
@@ -465,8 +450,6 @@ def test_ltx2_tiny_transformer_parity(
     ):
         fp32_ratio, bf16_ratio = DIT_RATIO_GATES[(variant, modality)]
         assert_parity(
-            record_property,
-            f"tiny-dit-{variant}-{modality}",
             ref=ref_out,
             ref_bf16=ref_bf16_out,
             tpu_fp32=tpu_outputs[torch.float32][idx],
@@ -501,7 +484,6 @@ TINY_CONNECTORS_CONFIG: dict[str, object] = {
 @torch.no_grad()
 def test_ltx2_tiny_connectors_parity(
     omni_ctx: None,
-    record_property: Callable[[str, object], None],
 ) -> None:
     """LTX2TextConnectors with _install_connector_attention matches diffusers CPU."""
     torch.manual_seed(0)
@@ -561,8 +543,6 @@ def test_ltx2_tiny_connectors_parity(
     ):
         fp32_ratio, bf16_ratio = CONNECTOR_RATIO_GATES[modality]
         assert_parity(
-            record_property,
-            f"tiny-connectors-{modality}",
             ref=ref_out,
             ref_bf16=ref_bf16_out,
             tpu_fp32=tpu_outputs[torch.float32][idx],

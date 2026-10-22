@@ -13,13 +13,7 @@
 # limitations under the License.
 """Shared TPU-vs-CPU parity helpers for the LTX-2 component test suite."""
 
-from collections.abc import Callable
-
 import torch
-
-from vllm_torchtpu.logger import init_logger
-
-logger = init_logger(__name__)
 
 # Default error-ratio bounds (omni_rel_l2 / diffusers_cpu_bf16_rel_l2), set ~3%
 # above the worst observed ratios across LTX-2 DiT and connector checks
@@ -43,17 +37,7 @@ def metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
     }
 
 
-def record(
-    record_property: Callable[[str, object], None], name: str, **data: object
-) -> None:
-    """Log parity metrics and attach them to the JUnit XML report."""
-    logger.info("[ltx2-parity] %s: %s", name, data)
-    record_property(name, data)
-
-
 def assert_parity(
-    record_property: Callable[[str, object], None],
-    name: str,
     *,
     ref: torch.Tensor,
     ref_bf16: torch.Tensor,
@@ -80,7 +64,6 @@ def assert_parity(
         "fp32_ratio": tpu_fp32_metrics["rel_l2"] / denom,
         "bf16_ratio": tpu_bf16_metrics["rel_l2"] / denom,
     }
-    record(record_property, name, **results)
     fp32_budget = max(fp32_ratio * ref_bf16_err, floor)
     bf16_budget = max(bf16_ratio * ref_bf16_err, floor)
     assert tpu_fp32_metrics["rel_l2"] <= fp32_budget, results
