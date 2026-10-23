@@ -280,6 +280,10 @@ class Qwen4ExpMTP(nn.Module):
     # draft then writes its QSA caches for every token but evaluates the
     # layer, and returns both outputs, at those rows only.
     supports_draft_rows = True
+    # The draft layer's routed experts are expert-parallel over the DP group
+    # like the target's, so under EP-DP lockstep every rank must replay the
+    # draft forwards (Qwen4ExpMTP is not a vLLM MixtureOfExperts model).
+    has_moe_layers = True
     # Identical to the target's: vLLM writes this onto the shared quant config.
     packed_modules_mapping = Qwen4ExpForCausalLM.packed_modules_mapping
 

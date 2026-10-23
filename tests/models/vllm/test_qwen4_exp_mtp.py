@@ -52,8 +52,8 @@ CHECKPOINT_MTP_TENSORS = [
 ]
 
 
-def mtp_config(k=3, tp=8):
-    cfg = config(tp=tp, dp=1)
+def mtp_config(k=3, tp=8, dp=1):
+    cfg = config(tp=tp, dp=dp)
     text = cfg.model_config.hf_text_config
     text.mtp_num_hidden_layers = 1
     text.mtp_use_dedicated_embeddings = False
@@ -98,7 +98,6 @@ def test_admits_native_mtp_on_unified_pool(k):
             lambda c: setattr(c.speculative_config, "draft_tensor_parallel_size", 1),
             "draft_tensor_parallel_size",
         ),
-        (lambda c: setattr(c.parallel_config, "data_parallel_size", 2), "data_par"),
         (
             lambda c: setattr(
                 c.model_config.hf_text_config, "mtp_use_dedicated_embeddings", True
@@ -115,10 +114,49 @@ def test_admits_native_mtp_on_unified_pool(k):
     ],
 )
 def test_rejects_unsupported_mtp(mutate, error):
-    cfg = mtp_config()
+    cfg = mtp_config(tp=4, dp=2)
     mutate(cfg)
     with pytest.raises(ValueError, match=error):
         validate_config(cfg)
+
+
+@pytest.mark.usefixtures("pooled")
+@pytest.mark.parametrize("tp,dp", [(8, 1), (4, 2), (2, 4), (1, 8)])
+@pytest.mark.parametrize("enable_ep", [False, True])
+def test_admits_mtp_with_local_data_parallelism(tp, dp, enable_ep):
+    cfg = mtp_config(tp=tp, dp=dp)
+    cfg.parallel_config.enable_expert_parallel = enable_ep
+    validate_config(cfg)
+
+
+@pytest.mark.usefixtures("pooled")
+@pytest.mark.parametrize(
+    "mutate,error",
+    [
+        (lambda p: setattr(p, "nnodes", 2), "one host"),
+        (lambda p: setattr(p, "data_parallel_size_local", 1), "local DP"),
+    ],
+)
+def test_rejects_mtp_with_multi_host_data_parallelism(mutate, error):
+    cfg = mtp_config(tp=4, dp=2)
+    mutate(cfg.parallel_config)
+    with pytest.raises(ValueError, match=error):
+        validate_config(cfg)
+
+
+@pytest.mark.usefixtures("pooled")
+def test_mtp_data_parallelism_rejects_most_model_len_chunks(monkeypatch):
+    monkeypatch.setenv("VLLM_TPU_MOST_MODEL_LEN", "4096")
+    validate_config(mtp_config(tp=8, dp=1))
+    with pytest.raises(ValueError, match="VLLM_TPU_MOST_MODEL_LEN"):
+        validate_config(mtp_config(tp=2, dp=4))
+
+
+def test_draft_declares_expert_parallel_moe():
+    from vllm_torchtpu.models.vllm.qwen4_exp.mtp import Qwen4ExpMTP
+
+    # Under EP-DP lockstep idle ranks replay the draft only if it reports MoE.
+    assert Qwen4ExpMTP.has_moe_layers is True
 
 
 def test_rejects_mtp_without_unified_pool(monkeypatch):

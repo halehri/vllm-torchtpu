@@ -396,6 +396,41 @@ class Qwen4ExpAdapter:
             active_rows=active,
         )
 
+    def draft_idle_metadata(self, names, num_reqs, num_tokens):
+        """MTP draft metadata for an EP-DP padding chunk, or None.
+
+        The same zero-request geometry as ``_idle_run`` (no query, zeroed
+        page tables, so nothing is read or written), in the form the target
+        forward hands the proposer: one entry per draft layer name, all
+        sharing one seq_lens tensor, so the padding chunk traces the programs
+        and collectives of a real chunk, including the fused draft loop.
+        Built once per token bucket; nothing mutates it (loop steps derive
+        fresh seq_lens).
+        """
+        if not self.pooled or self.cache is None:
+            return None
+        key = (num_reqs, num_tokens)
+        cached = getattr(self, "_draft_idle_metadata", None)
+        if cached is None:
+            cached = self._draft_idle_metadata = {}
+        if key in cached:
+            return cached[key]
+        device = self.runner.device
+        metadata = AttentionMetadata(
+            input_positions=torch.zeros(num_tokens, dtype=torch.int32, device=device),
+            block_tables=torch.zeros(0, dtype=torch.int32, device=device),
+            seq_lens=torch.zeros(num_reqs, dtype=torch.int32, device=device),
+            query_start_loc=torch.zeros(num_reqs + 1, dtype=torch.int32, device=device),
+            request_distribution=torch.zeros(3, dtype=torch.int32, device=device),
+        )
+        per_layer = cast("Qwen4ExpPooledCache", self.cache).dummy_metadata(metadata, 0)
+        if not set(names) <= per_layer.keys():
+            result = None
+        else:
+            result = {name: per_layer[name] for name in names}
+        cached[key] = result
+        return result
+
     def _idle_run(self, num_tokens, num_reqs):
         """Participate in remote work without touching local live owners."""
         device = self.runner.device

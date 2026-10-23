@@ -237,6 +237,9 @@ class _DpDummyDraft:
     # drafts one plain tensor; MTP drafts combine nothing.
     combine_aux: list[torch.Tensor]
     combine_plain: torch.Tensor | None
+    # Draft step 0's fixed-length row selection (VLLM_TPU_MTP_DRAFT_ROWS),
+    # all -1; None when step 0 runs at every token.
+    draft_rows: torch.Tensor | None = None
 
 
 class Eagle3Proposer:
@@ -470,8 +473,10 @@ class Eagle3Proposer:
         later draft steps read. A draft declaring `supports_draft_rows`
         writes those caches for all tokens and evaluates the layer at the
         given rows. Excluded: IndexShare (its saved top-k rows are per
-        token), context parallelism (rows are rank-local) and EP-DP lockstep
-        (padding chunks replay full-width step-0 collectives).
+        token) and context parallelism (rows are rank-local). Under EP-DP
+        lockstep, padding chunks replay step 0 with the same fixed-length
+        rows, which needs every chunk to have the same request capacity
+        (no VLLM_TPU_MOST_MODEL_LEN chunks).
         """
         if not envs.VLLM_TPU_MTP_DRAFT_ROWS:
             return False
@@ -484,14 +489,16 @@ class Eagle3Proposer:
             )
             return False
         runner = self.runner
-        if (
-            self._share_mtp_indices
-            or getattr(runner, "_pcp_enabled", False)
-            or runner._dp_lockstep_enabled()
-        ):
+        if self._share_mtp_indices or getattr(runner, "_pcp_enabled", False):
             logger.warning_once(
-                "VLLM_TPU_MTP_DRAFT_ROWS is unsupported with IndexShare, "
-                "context parallelism or EP-DP lockstep; ignoring it."
+                "VLLM_TPU_MTP_DRAFT_ROWS is unsupported with IndexShare or "
+                "context parallelism; ignoring it."
+            )
+            return False
+        if self._dp_lockstep_sharded() and not self._dp_uniform_chunk_capacity():
+            logger.warning_once(
+                "VLLM_TPU_MTP_DRAFT_ROWS under EP-DP lockstep needs one chunk "
+                "request capacity (VLLM_TPU_MOST_MODEL_LEN unset); ignoring it."
             )
             return False
         logger.info("MTP draft step 0 runs at each request's last token only.")
@@ -1633,11 +1640,14 @@ class Eagle3Proposer:
                     )
                 loop_hidden[ci] = hidden
 
-            if self._mtp_fused_loop is not None and not runner._dp_lockstep_enabled():
+            if self._dp_fused_loop():
                 # Fused: each chunk's steps 1..K-1 in one dispatch. Chunk-major
                 # is fine here: the separate path is step-major only for
                 # IndexShare's shared top-k buffer, which the fused program
-                # never runs with.
+                # never runs with. EP-DP padding chunks follow the real ones,
+                # one fused program each, as an idle rank's
+                # run_dp_dummy_draft does.
+                lockstep = self._dp_lockstep_sharded()
                 for ci, chunk in enumerate(chunks):
                     fused = self._run_mtp_fused_loop(
                         chunk=chunk,
@@ -1652,9 +1662,19 @@ class Eagle3Proposer:
                     if fused is not None:
                         draft_tokens_per_chunk[ci].extend(fused)
                         continue
+                    if lockstep:
+                        # Peer ranks' padding chunks run the fused program;
+                        # a per-step fallback here would pair other programs.
+                        raise RuntimeError(
+                            "MTP fused draft loop rejected a chunk's metadata "
+                            "under EP-DP lockstep"
+                        )
                     # This chunk's metadata doesn't fit the program.
                     for step in range(1, K):
                         run_draft_step(ci, step)
+                if dp_dummy is not None:
+                    for _ in range(num_dp_pad_chunks):
+                        self._dp_dummy_fused_loop(dp_dummy)
             else:
                 # Separate: one draft forward and one lm-head per step.
                 for step in range(1, K):
@@ -2435,8 +2455,50 @@ class Eagle3Proposer:
                 return False
             from vllm.model_executor.models.interfaces import is_mixture_of_experts
 
-            self._draft_has_moe_cache = bool(is_mixture_of_experts(self.draft_model))
+            # A draft that does not implement vLLM's MixtureOfExperts
+            # interface (Qwen4ExpMTP) declares its expert-parallel MoE layers.
+            self._draft_has_moe_cache = bool(
+                is_mixture_of_experts(self.draft_model)
+                or getattr(self.draft_model, "has_moe_layers", False)
+            )
         return self._draft_has_moe_cache
+
+    def _dp_uniform_chunk_capacity(self) -> bool:
+        """Whether every chunk has the dummy chunk's request capacity.
+
+        EP-DP padding chunks are max-model-len chunks; with
+        VLLM_TPU_MOST_MODEL_LEN a real chunk may use the most-model-len
+        capacity instead, and shapes that follow the capacity (draft step 0's
+        rows) would then differ across ranks.
+        """
+        runner = self.runner
+        return (
+            getattr(runner, "most_model_len", None) is None
+            or runner.num_reqs_most_model_len is None
+            or runner.num_reqs_most_model_len == runner.num_reqs_max_model_len
+        )
+
+    def _dp_dummy_metadata_provider(self):
+        """The model adapter's zero-request draft metadata for EP-DP padding
+        chunks, or None to rebuild it through the runner's builders."""
+        adapter = getattr(self.runner, "model_adapter", None)
+        return getattr(adapter, "draft_idle_metadata", None)
+
+    def _dp_fused_loop(self) -> bool:
+        """Whether loop steps 1..K-1 run as the fused program this step.
+
+        Under EP-DP lockstep a padding chunk replays the fused program too,
+        which needs padding chunks and real chunks to build the same
+        loop-step metadata structure (one shared seq_lens tensor). Only a
+        model adapter that supplies the padding chunks' metadata in the
+        target metadata's form guarantees that; other drafts keep the
+        per-step loop under lockstep.
+        """
+        if self._mtp_fused_loop is None:
+            return False
+        if not self._dp_lockstep_sharded():
+            return True
+        return self._dp_dummy_metadata_provider() is not None
 
     def _dp_lockstep_sharded(self) -> bool:
         """True when the draft emits cross-DP collectives under EP-DP lockstep.
@@ -2565,11 +2627,18 @@ class Eagle3Proposer:
             return
         self._draft_md_cache.clear()
         dummy = self._build_dp_dummy_draft()
-        toks = [
-            self._dp_dummy_draft_step(dummy, step)
-            for step in range(K)
-            for _ in range(num_chunks)
-        ]
+        if K > 1 and self._dp_fused_loop():
+            # propose()'s fused order: every chunk's step 0, then each
+            # chunk's fused steps 1..K-1.
+            toks = [self._dp_dummy_draft_step(dummy, 0) for _ in range(num_chunks)]
+            for _ in range(num_chunks):
+                toks.extend(self._dp_dummy_fused_loop(dummy))
+        else:
+            toks = [
+                self._dp_dummy_draft_step(dummy, step)
+                for step in range(K)
+                for _ in range(num_chunks)
+            ]
         # Nothing consumes the drafts; wait so this idle rank's draft
         # collectives have fired before it moves on.
         synchronize_tensors(toks)
@@ -2601,25 +2670,51 @@ class Eagle3Proposer:
             device=runner.device,
         )
 
-        actual_num_reqs = min(bucket, num_reqs)
-        qsl_np = np.arange(num_reqs + 1, dtype=np.int32)
-        attn_ctx = AttentionMetadataBuilderContext(
-            num_reqs=num_reqs,
-            start_index=0,
-            use_max_model_len=True,
-            seq_lens=torch.ones(num_reqs, dtype=torch.int32, device=runner.device),
-            query_start_loc=torch.from_numpy(qsl_np).to(runner.device),
-            request_distribution=torch.tensor(
-                [actual_num_reqs, actual_num_reqs, actual_num_reqs],
-                dtype=torch.int32,
-                device=runner.device,
-            ),
-            # Fixed positions => the attn-metadata build takes the dummy-safe
-            # zeroed-block-table branch (attention_metadata.py) instead of
-            # slicing the real block table, which on an idle rank is shorter
-            # than num_reqs and would fail to broadcast.
-            position_ids_override=token_positions,
-        )
+        provider = self._dp_dummy_metadata_provider()
+        draft_md = None
+        if provider is not None:
+            assert self._draft_attn_layer_names is not None
+            draft_md = provider(self._draft_attn_layer_names, num_reqs, bucket)
+        if draft_md is not None:
+            # Model-owned zero-request metadata in the target metadata's
+            # form: no query, no cache write, zeroed page tables. The chunk
+            # then takes propose()'s real-chunk path (step 0 reads it, loop
+            # steps replace seq_lens / query_start_loc / distribution), so
+            # it traces the same programs as a real chunk, the fused loop
+            # included.
+            actual_num_reqs = 0
+            seq_lens = next(iter(draft_md.values())).seq_lens
+            qsl_np = np.zeros(num_reqs + 1, dtype=np.int32)
+            attn_ctx = AttentionMetadataBuilderContext(
+                num_reqs=num_reqs,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=seq_lens,
+                query_start_loc=torch.from_numpy(qsl_np).to(runner.device),
+                request_distribution=torch.zeros(
+                    3, dtype=torch.int32, device=runner.device
+                ),
+            )
+        else:
+            actual_num_reqs = min(bucket, num_reqs)
+            qsl_np = np.arange(num_reqs + 1, dtype=np.int32)
+            attn_ctx = AttentionMetadataBuilderContext(
+                num_reqs=num_reqs,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.ones(num_reqs, dtype=torch.int32, device=runner.device),
+                query_start_loc=torch.from_numpy(qsl_np).to(runner.device),
+                request_distribution=torch.tensor(
+                    [actual_num_reqs, actual_num_reqs, actual_num_reqs],
+                    dtype=torch.int32,
+                    device=runner.device,
+                ),
+                # Fixed positions => the attn-metadata build takes the
+                # dummy-safe zeroed-block-table branch (attention_metadata.py)
+                # instead of slicing the real block table, which on an idle
+                # rank is shorter than num_reqs and would fail to broadcast.
+                position_ids_override=token_positions,
+            )
         chunk = DraftChunkInputs(
             input_ids=input_ids,
             position_ids=positions,
@@ -2628,6 +2723,19 @@ class Eagle3Proposer:
             start_index=0,
             num_reqs=num_reqs,
             aux_hidden_states=[],
+            attn_metadata=draft_md,
+        )
+        # Draft step 0's fixed-length rows, all empty (-1), as propose()
+        # passes them for a chunk of this capacity.
+        draft_rows = (
+            torch.full(
+                (self._draft_rows_len(chunk),),
+                -1,
+                dtype=torch.int64,
+                device=runner.device,
+            )
+            if self._draft_rows
+            else None
         )
         p = self._loop_bucket(num_reqs)
         draft_hidden = self._draft_hidden_size()
@@ -2682,7 +2790,30 @@ class Eagle3Proposer:
             ),
             combine_aux=combine_aux,
             combine_plain=combine_plain,
+            draft_rows=draft_rows,
         )
+
+    def _dp_dummy_fused_loop(self, dummy: _DpDummyDraft) -> tuple[torch.Tensor, ...]:
+        """Draft steps 1..K-1 of one EP-DP padding chunk as the fused program
+        propose() runs for a real chunk."""
+        fused = self._run_mtp_fused_loop(
+            chunk=dummy.chunk,
+            input_ids=dummy.loop_input_ids,
+            positions=dummy.loop_positions + 1,
+            hidden_states=dummy.loop_hidden,
+            num_rejected_np=None,
+            num_rejected_dev=None,
+            loop_query_start_loc=dummy.loop_query_start_loc,
+            loop_request_distribution=dummy.loop_request_distribution,
+        )
+        if fused is None:
+            raise RuntimeError(
+                "MTP fused draft loop rejected an EP-DP padding chunk's metadata"
+            )
+        # Nothing consumes the result; enqueue it at its place in the
+        # collective order without blocking the host.
+        synchronize_tensors(list(fused), wait=False)
+        return fused
 
     def _dp_dummy_draft_step(self, dummy: _DpDummyDraft, step: int) -> torch.Tensor:
         """Draft step `step` of one EP-DP padding chunk: the programs and
@@ -2704,6 +2835,7 @@ class Eagle3Proposer:
                 seq_lens_delta=0,
                 num_rejected_np=None,
                 num_tokens_padded=dummy.bucket,
+                draft_rows=dummy.draft_rows,
             )
             lm_head_input = dummy.first_pass_carry
         else:

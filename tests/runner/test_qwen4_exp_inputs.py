@@ -291,3 +291,46 @@ def test_ngram_history_uses_configured_width_and_eos():
         store, torch.tensor([0, 0]), torch.tensor([1, 4]), eos_token_id=7, ngram_size=4
     )
     assert history.tolist() == [[7, 7, 11], [12, 13, 14]]
+
+
+def test_draft_idle_metadata_is_zero_request_and_shares_seq_lens():
+    """EP-DP padding chunks get the draft layers' entries in the target
+    metadata's form: no query, zeroed tables, one shared seq_lens tensor
+    (the fused draft loop bumps a single seq_lens in place)."""
+    calls = []
+
+    def dummy_metadata(metadata, active_rows):
+        calls.append(active_rows)
+        names = ("mtp.attn", "mtp.attn.raw_ring", "packed.compressed", "model.gdn")
+        return {
+            name: NS(
+                seq_lens=metadata.seq_lens,
+                query_start_loc=metadata.query_start_loc,
+                request_distribution=metadata.request_distribution,
+                input_positions=metadata.input_positions,
+                block_tables=torch.zeros(4, dtype=torch.int32),
+            )
+            for name in names
+        }
+
+    adapter = Qwen4ExpAdapter.__new__(Qwen4ExpAdapter)
+    adapter.runner = NS(device="cpu")
+    adapter.pooled = True
+    adapter.cache = NS(dummy_metadata=dummy_metadata)
+    names = {"mtp.attn", "mtp.attn.raw_ring", "packed.compressed"}
+    md = adapter.draft_idle_metadata(names, 4, 64)
+    assert md.keys() == names
+    assert calls == [0]
+    (seq_lens,) = {id(m.seq_lens): m.seq_lens for m in md.values()}.values()
+    assert seq_lens.tolist() == [0, 0, 0, 0]
+    entry = md["mtp.attn"]
+    assert entry.query_start_loc.tolist() == [0] * 5
+    assert entry.request_distribution.tolist() == [0, 0, 0]
+    assert entry.input_positions.shape == (64,)
+    # Built once per (requests, bucket).
+    assert adapter.draft_idle_metadata(names, 4, 64) is md
+    assert calls == [0]
+    # A draft layer the pool has no group for: let the proposer rebuild.
+    assert adapter.draft_idle_metadata(names | {"missing"}, 4, 32) is None
+    adapter.pooled = False
+    assert adapter.draft_idle_metadata(names, 4, 16) is None

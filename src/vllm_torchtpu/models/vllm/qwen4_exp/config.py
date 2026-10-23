@@ -686,6 +686,28 @@ def validate_host_offload_config(cfg):
         )
 
 
+def validate_mtp_data_parallel(p):
+    """Admit MTP with data parallelism on one host.
+
+    Each DP rank is its own engine with its own unified pool and draft. With
+    expert parallelism the experts (the draft layer's included) span the DP
+    group, so an idle or shorter rank replays the busy ranks' draft trace:
+    the same step-0 forward (at the same fixed draft rows) and the same fused
+    or per-step loop programs, in the same order. That replay is built for
+    max-model-len chunks only, so every chunk must share that capacity.
+    """
+    if p.nnodes != 1 or p.data_parallel_size_local != p.data_parallel_size:
+        raise ValueError(
+            "Qwen4Exp TPU MTP with data_parallel_size>1 requires local DP on one host"
+        )
+    if envs.VLLM_TPU_MOST_MODEL_LEN is not None:
+        raise ValueError(
+            "Qwen4Exp TPU MTP with data_parallel_size>1 requires "
+            "VLLM_TPU_MOST_MODEL_LEN unset (EP-DP draft padding chunks use the "
+            "max-model-len request capacity)"
+        )
+
+
 def validate_mtp_config(cfg):
     """Admit only the checkpoint's native MTP draft on the unified pool.
 
@@ -727,8 +749,8 @@ def validate_mtp_config(cfg):
             "Qwen4Exp MTP requires draft_tensor_parallel_size equal to the "
             "target tensor_parallel_size"
         )
-    if p.data_parallel_size != 1:
-        raise ValueError("Qwen4Exp TPU MTP currently requires data_parallel_size=1")
+    if p.data_parallel_size > 1:
+        validate_mtp_data_parallel(p)
     if pd_transfer_enabled(cfg):
         raise ValueError("Qwen4Exp PD requires MTP off")
     if getattr(cfg.cache_config, "mamba_cache_mode", "none") not in ("none", "align"):

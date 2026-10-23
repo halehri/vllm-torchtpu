@@ -349,7 +349,9 @@ class Qwen4ExpPooledCache:
         GDN and PLE would turn profiling into destructive cross-owner writes.
         """
         rows = metadata.seq_lens.shape[0]
-        seq_lens_cpu = metadata.seq_lens.to("cpu")
+        # Host copy only when rows own pages: an idle (zero-row) call stays
+        # free of device syncs.
+        seq_lens_cpu = metadata.seq_lens.to("cpu") if active_rows else None
         result = {}
         next_page = 1
         # Speculative decoding: state groups own one checkpoint block per
@@ -383,6 +385,7 @@ class Qwen4ExpPooledCache:
             )
             table = torch.zeros((rows, columns), dtype=torch.int32, device="cpu")
             for row in range(active_rows):
+                assert seq_lens_cpu is not None
                 req_blocks = max(
                     1,
                     (int(seq_lens_cpu[row]) + spec.block_size - 1) // spec.block_size,
