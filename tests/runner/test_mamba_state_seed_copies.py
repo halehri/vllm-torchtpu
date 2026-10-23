@@ -114,6 +114,8 @@ def _make_self(
         device="cpu",
         mamba_slot_read_offsets=read_offsets,
         _pending_mamba_state_copies=[],
+        _mamba_state_pos_pending={},
+        max_num_reqs=16,
         input_batch=input_batch,
     )
     # Padding/expansion/source-selection helpers the collector calls on
@@ -126,6 +128,9 @@ def _make_self(
         "_expand_pool_split",
         "_spec_seed_sources",
         "_copy_mamba_state_blocks",
+        "_resolve_pending_mamba_state_pos",
+        "_stage_batched_spec_seed",
+        "_seed_zero_rejected",
     ):
         setattr(ns, name, getattr(TPUModelRunner, name).__get__(ns))
     return ns, raws
@@ -946,3 +951,142 @@ def test_async_state_seed_keeps_actual_crossing_when_all_drafts_accepted():
     _collect(fake, _sched({"a": 4}))
     assert fake._mamba_state_pos["a"] == 1
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(8, 6)]
+
+
+# --- async spec decode: deferred (on-device) rejection correction --------
+
+
+def _async_spec_fake(computed, scheduled, state_pos, offsets, shared_pool):
+    fake, pools = _make_self(
+        ["a"],
+        [computed],
+        [[[5, 6, 7, 8, 9, 10]], [[15, 16, 17, 18, 19, 20]]],
+        state_pos={"a": state_pos},
+        state_block_size=384,
+        ckpt_window=4,
+        read_offsets=offsets.clone(),
+    )
+    if shared_pool:
+        fake._mamba_copy_plan = [(1, [pools[0]]), (2, [pools[0]])]
+        pools = pools[:1]
+    for pool in pools:
+        pool.copy_(torch.arange(NUM_BLOCKS).unsqueeze(1).expand_as(pool))
+    fake.scheduler_config = SimpleNamespace(async_scheduling=True)
+    fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    return fake, pools
+
+
+def _apply(fake, pools):
+    for raws, src_t, dst_t in fake._pending_mamba_state_copies:
+        pool = raws[0]
+        pool[dst_t.long()] = pool[src_t.long()].clone()
+    return [pool.clone() for pool in pools]
+
+
+@pytest.mark.parametrize("shared_pool", [False, True])
+@pytest.mark.parametrize("drafts", [1, 3])
+@pytest.mark.parametrize("state_pos", [0, 1])
+def test_deferred_async_correction_matches_blocking_wait(
+    monkeypatch, shared_pool, drafts, state_pos
+):
+    """Device-side destination choice == the blocking host correction, for
+    every rejection outcome near a boundary, and the host state column is
+    recovered later without waiting during the deferring step."""
+    monkeypatch.setenv("VLLM_TPU_BATCHED_MAMBA_SEED", "1")
+    gen = torch.Generator().manual_seed(drafts * 7 + state_pos)
+    for computed in range(380, 392):
+        for scheduled in (1, drafts + 1):
+            for rejected in range(drafts + 1):
+                offsets = torch.randint(
+                    0, 4, (NUM_BLOCKS,), dtype=torch.int32, generator=gen
+                )
+                # Invariant: the null block's offset is always 0 (every reset
+                # and post-verify scatter of a padded row writes 0 there).
+                offsets[0] = 0
+                accepted = drafts + 1 - rejected
+                sampled = torch.tensor([[77] * accepted + [-1] * (4 - accepted)])
+
+                ref, ref_pools = _async_spec_fake(
+                    computed, scheduled, state_pos, offsets, shared_pool
+                )
+                ref._pre_async_results = SimpleNamespace(
+                    req_id_to_index_copy={"a": 0},
+                    num_draft_per_req={0: drafts},
+                    spec_decode_num_rejected_tokens=torch.tensor([rejected]),
+                    wait_for_copy=lambda sampled=sampled: sampled,
+                )
+                _collect(ref, _sched({"a": scheduled}))
+
+                fake, pools = _async_spec_fake(
+                    computed, scheduled, state_pos, offsets, shared_pool
+                )
+                waited = []
+
+                def wait(sampled=sampled, waited=waited):
+                    waited.append(True)
+                    return sampled
+
+                previous = SimpleNamespace(
+                    req_id_to_index_copy={"a": 0},
+                    num_draft_per_req={0: drafts},
+                    spec_decode_num_rejected_tokens=torch.tensor([rejected]),
+                    copy_state=SimpleNamespace(chunk_real_lens=[1]),
+                    wait_for_copy=wait,
+                )
+                fake._pre_async_results = previous
+                _collect(fake, _sched({"a": scheduled}))
+                assert not waited
+                case = (computed, scheduled, rejected)
+                ref_pairs = [p for e in ref._pending_mamba_state_copies for p in _real_pairs(e)]
+                pairs = [p for e in fake._pending_mamba_state_copies for p in _real_pairs(e)]
+                assert pairs == ref_pairs, case
+                for got, want in zip(_apply(fake, pools), _apply(ref, ref_pools)):
+                    assert torch.equal(got, want), case
+                assert torch.equal(
+                    fake.mamba_slot_read_offsets, ref.mamba_slot_read_offsets
+                ), case
+                # A later chunk of the same step must not wait either.
+                step = fake._mamba_state_pos_pending.get("a", (None,) * 5)[4]
+                TPUModelRunner._resolve_pending_mamba_state_pos(fake, 384, step)
+                assert not waited
+                TPUModelRunner._resolve_pending_mamba_state_pos(
+                    fake, 384, _sched({"a": 1})
+                )
+                assert fake._mamba_state_pos == ref._mamba_state_pos, case
+                assert fake._mamba_state_pos_pending == {}
+
+
+def test_deferred_async_correction_off_keeps_blocking_path(monkeypatch):
+    monkeypatch.setenv("VLLM_TPU_BATCHED_MAMBA_SEED", "0")
+    offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
+    fake, _ = _async_spec_fake(383, 4, 0, offsets, True)
+    waited = []
+    fake._pre_async_results = SimpleNamespace(
+        req_id_to_index_copy={"a": 0},
+        num_draft_per_req={0: 3},
+        spec_decode_num_rejected_tokens=torch.tensor([0]),
+        copy_state=SimpleNamespace(chunk_real_lens=[1]),
+        wait_for_copy=lambda: waited.append(1) or torch.tensor([[1, 2, 3, 4]]),
+    )
+    _collect(fake, _sched({"a": 4}))
+    assert waited and fake._mamba_state_pos["a"] == 1
+    assert fake._mamba_state_pos_pending == {}
+
+
+def test_pending_state_column_dropped_for_finished_request(monkeypatch):
+    monkeypatch.setenv("VLLM_TPU_BATCHED_MAMBA_SEED", "1")
+    offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
+    fake, _ = _async_spec_fake(383, 4, 0, offsets, True)
+    fake._pre_async_results = SimpleNamespace(
+        req_id_to_index_copy={"a": 0},
+        num_draft_per_req={0: 3},
+        spec_decode_num_rejected_tokens=torch.tensor([1]),
+        copy_state=SimpleNamespace(chunk_real_lens=[1]),
+        wait_for_copy=lambda: pytest.fail("finished request must not wait"),
+    )
+    _collect(fake, _sched({"a": 4}))
+    assert "a" in fake._mamba_state_pos_pending
+    fake.requests = {}
+    fake._pre_async_results = None
+    TPUModelRunner._resolve_pending_mamba_state_pos(fake, 384)
+    assert fake._mamba_state_pos_pending == {}

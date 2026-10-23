@@ -184,6 +184,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
     VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE: bool = True
     VLLM_TPU_QWEN4_NGRAM_WINDOW: bool = True
+    VLLM_TPU_BATCHED_MAMBA_SEED: bool = True
     VLLM_TPU_MTP_DRAFT_ROWS: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
@@ -1153,6 +1154,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (32 MB at 32 x 256K), the only part the n-gram history reads.
     "VLLM_TPU_QWEN4_NGRAM_WINDOW": env_bool(
         "VLLM_TPU_QWEN4_NGRAM_WINDOW", default=True
+    ),
+    # Async spec decode with mamba align mode: resolve the post-rejection
+    # state-block seed destination on device and seed every mamba group with
+    # one compiled program, instead of blocking on the previous step's
+    # sampled-token copy and launching per-group gathers.
+    "VLLM_TPU_BATCHED_MAMBA_SEED": env_bool(
+        "VLLM_TPU_BATCHED_MAMBA_SEED", default=True
     ),
     # MTP draft step 0 on a draft declaring `supports_draft_rows` (Qwen4Exp):
     # write the draft layer's caches for every token of the target's step but

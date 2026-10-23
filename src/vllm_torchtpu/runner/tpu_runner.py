@@ -271,7 +271,75 @@ def _update_read_offsets_impl(
     read_offsets.index_put_((indices,), offsets.repeat(len(groups)))
 
 
+def _batched_spec_seed_impl(
+    read_offsets: torch.Tensor,
+    plan: torch.Tensor,
+    num_rejected: torch.Tensor,
+    split: int,
+    reset_offsets: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Every mamba group's state-block seed pairs for one step, in one program.
+
+    `plan` is `[n, window + 6]` int32, one row per (group, crossing):
+    `[state_src, ckpt_0 .. ckpt_{window-1}, new_owner, dst_lo, dst_hi,
+    rejected_index, threshold]`.
+
+    * The source is the checkpoint the request resumes from: `ckpt[offset]`
+      with `offset = read_offsets[state_src]` (0 for a new owner), exactly
+      `TPUModelRunner._spec_seed_sources`.
+    * The destination is `dst_hi` unless the previous step rejected more than
+      `threshold` drafts, in which case the state column is one lower and the
+      destination is `dst_lo`. Rows with `rejected_index < 0` are certain and
+      always take `dst_hi`. `num_rejected` is the previous step's on-device
+      rejected count, the same value the forward subtracts from its
+      positions.
+    * A destination of 0 means "no seed" (no crossing for that outcome, or a
+      skipped pair); the row then degenerates to the null-block `(0, 0)`
+      self-copy the bucket padding already uses, and its read-offset reset
+      lands on the null block.
+
+    Returns pool-level `(src, dst)` (expanded by the manager-to-pool `split`)
+    and the manager-level destinations. With `reset_offsets` the seeded
+    checkpoint becomes checkpoint 0 of the new group here, after all sources
+    have been read.
+    """
+    window = plan.shape[1] - 6
+    state = plan[:, 0].long()
+    ckpt = plan[:, 1 : window + 1]
+    new_owner = plan[:, window + 1] != 0
+    dst_lo = plan[:, window + 2]
+    dst_hi = plan[:, window + 3]
+    rejected_index = plan[:, window + 4].long()
+    threshold = plan[:, window + 5]
+    off = read_offsets[state].long().clamp(0, window - 1)
+    off = torch.where(new_owner, 0, off)
+    src = ckpt.gather(1, off.unsqueeze(1)).squeeze(1)
+    rejected = torch.where(
+        rejected_index >= 0,
+        num_rejected[rejected_index.clamp(min=0)].to(threshold.dtype),
+        0,
+    )
+    dst = torch.where(rejected <= threshold, dst_hi, dst_lo)
+    src = torch.where(dst != 0, src, 0)
+    if reset_offsets:
+        read_offsets.index_put_(
+            (dst.long(),),
+            torch.zeros(dst.shape[0], dtype=read_offsets.dtype, device=dst.device),
+        )
+    if split > 1:
+        # Skipped rows stay all-null, like the per-group path's padding.
+        j = torch.arange(split, dtype=src.dtype, device=src.device)
+        live = (dst != 0).unsqueeze(1)
+        return (
+            torch.where(live, src.unsqueeze(1) * split + j, 0).reshape(-1),
+            torch.where(live, dst.unsqueeze(1) * split + j, 0).reshape(-1),
+            dst,
+        )
+    return src, dst, dst
+
+
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+_batched_spec_seed_compiled = _tpu_compile(_batched_spec_seed_impl)
 _reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
 _update_read_offsets_compiled = _tpu_compile(_update_read_offsets_impl)
 _rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
@@ -937,6 +1005,14 @@ class TPUModelRunner(GPUModelRunner):
         # mapping (built in initialize_kv_cache), and the block-seed copies
         # staged by _prepare_inputs and flushed before the forward.
         self._mamba_state_pos: dict[str, int] = {}
+        # Async spec decode: requests whose state column this step depends on
+        # the previous step's (still in flight) acceptance. The seed copy
+        # resolves it on device; the host position is filled in from the
+        # sampled-token copy at a later step, once that copy has landed:
+        # req_id -> (results, results_row, num_drafts, optimistic_end, step).
+        self._mamba_state_pos_pending: dict[
+            str, tuple[Any, int, int, int, Any]
+        ] = {}
         self._mamba_copy_plan: list[tuple[int, list[torch.Tensor]]] = []
         # Manager-block -> pool-block split: >1 when the pool is born at a
         # smaller attention-kernel granularity (batched RPA).
@@ -1902,11 +1978,28 @@ class TPUModelRunner(GPUModelRunner):
         col_stride = self._mamba_state_block_size * cp_world_size
         num_computed = self.input_batch.num_computed_tokens_cpu
         req_ids = self.input_batch.req_ids
+        self._resolve_pending_mamba_state_pos(col_stride, scheduler_output)
         crossings: list[tuple[int, int, int]] = []
+        # Crossings whose destination column depends on the previous step's
+        # acceptance: (row, prev, high column, threshold, results row).
+        uncertain: list[tuple[int, int, int, int, int]] = []
         previous = (
             self._pre_async_results
             if self.scheduler_config.async_scheduling and self.speculative_config
             else None
+        )
+        window = self._mamba_ckpt_window
+        spec_seed = self.mamba_slot_read_offsets is not None and window > 1
+        # The device can pick the post-rejection destination itself when the
+        # previous result is a single chunk (its row index then addresses the
+        # sampled copy, the draft counts and the rejected counts alike).
+        defer_correction = (
+            envs.VLLM_TPU_BATCHED_MAMBA_SEED
+            and spec_seed
+            and previous is not None
+            and getattr(previous, "spec_decode_num_rejected_tokens", None) is not None
+            and getattr(previous, "copy_state", None) is not None
+            and len(previous.copy_state.chunk_real_lens) == 1
         )
         sampled_cpu: torch.Tensor | None = None
         for i in range(num_reqs):
@@ -1927,6 +2020,33 @@ class TPUModelRunner(GPUModelRunner):
                 # Only near a block edge can the correction change the seed
                 # destination; reuse the pending sampling copy in that case.
                 if end_position // col_stride != (end_position - drafts) // col_stride:
+                    if (
+                        defer_correction
+                        and previous_row is not None
+                        and req_id in self._mamba_state_pos
+                        and drafts < col_stride
+                    ):
+                        # The real column is high_col unless more than
+                        # `threshold` drafts were rejected (then high_col - 1).
+                        # Decide on device instead of waiting for the copy.
+                        high_col = end_position // col_stride
+                        uncertain.append(
+                            (
+                                row,
+                                self._mamba_state_pos.pop(req_id),
+                                high_col,
+                                end_position - high_col * col_stride,
+                                previous_row,
+                            )
+                        )
+                        self._mamba_state_pos_pending[req_id] = (
+                            previous,
+                            previous_row,
+                            drafts,
+                            end_position,
+                            scheduler_output,
+                        )
+                        continue
                     if sampled_cpu is None:
                         sampled_cpu = previous.wait_for_copy()
                         assert sampled_cpu is not None
@@ -1942,8 +2062,12 @@ class TPUModelRunner(GPUModelRunner):
             self._mamba_state_pos[req_id] = curr
             if 0 <= prev != curr:
                 crossings.append((row, prev, curr))
-        if not crossings:
+        if not crossings and not uncertain:
             return
+        if spec_seed and envs.VLLM_TPU_BATCHED_MAMBA_SEED:
+            self._stage_batched_spec_seed(crossings, uncertain, previous)
+            return
+        assert not uncertain
 
         # Speculative decoding: the checkpoint group slides with the state
         # column. vLLM's MambaManager appends one block and never shifts, so
@@ -1956,8 +2080,6 @@ class TPUModelRunner(GPUModelRunner):
         # checkpoint 0 of the new group, so the read offset resets to 0.
         # That index lives in the device-resident read-offset buffer, hence
         # the device-side gather in `_spec_seed_sources`.
-        window = self._mamba_ckpt_window
-        spec_seed = self.mamba_slot_read_offsets is not None and window > 1
 
         # Keyed by the set of raw buffers a group lives on; groups sharing
         # the same buffers are seeded by one program.
@@ -2064,6 +2186,165 @@ class TPUModelRunner(GPUModelRunner):
                 self.device, non_blocking=True
             )
             self._pending_mamba_state_copies.append((raws, src_t, dst_t))
+
+    def _resolve_pending_mamba_state_pos(
+        self, col_stride: int, scheduler_output: Any = None
+    ) -> None:
+        """Fill in the host state column of requests whose seed destination a
+        previous step left to the device (see `_stage_batched_spec_seed`).
+
+        Same arithmetic as the blocking correction in
+        `_collect_mamba_state_seed_copies`. Entries recorded during this
+        step (a later chunk of it) wait, so this never blocks on the copy the
+        deferral avoided; older results' copies have landed by now (the
+        engine consumed them to schedule this step).
+        """
+        pending = self._mamba_state_pos_pending
+        if not pending:
+            return
+        live_req_ids = self.requests.keys()
+        for req_id, entry in list(pending.items()):
+            previous, previous_row, drafts, end_position, step = entry
+            if req_id not in live_req_ids:
+                del pending[req_id]
+                continue
+            if scheduler_output is not None and step is scheduler_output:
+                continue
+            del pending[req_id]
+            sampled_cpu = previous.wait_for_copy()
+            assert sampled_cpu is not None
+            accepted = int((sampled_cpu[previous_row] != INVALID_TOKEN_ID).sum().item())
+            rejected = max(0, drafts + 1 - accepted)
+            self._mamba_state_pos[req_id] = (end_position - rejected) // col_stride
+
+    def _stage_batched_spec_seed(
+        self,
+        crossings: list[tuple[int, int, int]],
+        uncertain: list[tuple[int, int, int, int, int]],
+        previous: Any,
+    ) -> None:
+        """Speculative-decoding seed copies for every mamba group in one
+        upload and one compiled program per raw-pool set.
+
+        Replaces the per-group `_spec_seed_sources` gathers and H2D copies.
+        Certain crossings produce the same (src, dst) pairs and read-offset
+        resets as the per-group path. `uncertain` crossings carry both
+        candidate destinations; `_batched_spec_seed_impl` picks one from the
+        previous step's on-device rejected count, so the host never waits for
+        the sampled-token copy. The metadata tensors the forward reads
+        (state indices, checkpoint indices, read offsets) are untouched in
+        meaning and layout.
+        """
+        window = self._mamba_ckpt_window
+        req_ids = self.input_batch.req_ids
+        per_raw: dict[tuple[int, ...], tuple[list[torch.Tensor], list[list[int]]]] = {}
+        for gid, raws in self._mamba_copy_plan:
+            bt = self.input_batch.block_table[gid].get_cpu_tensor()
+            row_width = bt.shape[1]
+            plan_rows: list[list[int]] = []
+
+            def ckpts(row: int, prev: int, src: int) -> list[int]:
+                # As in the per-group path: unfilled columns fall back to the
+                # state block.
+                out = []
+                for t in range(window):
+                    col = prev + t
+                    ckpt = int(bt[row, col]) if col < row_width else 0
+                    out.append(ckpt if ckpt != 0 else src)
+                return out
+
+            for row, prev, curr in crossings:
+                src = int(bt[row, prev])
+                dst = int(bt[row, curr])
+                if src == dst or src == 0 or dst == 0:
+                    continue
+                new_owner = int(req_ids[row] not in self._mamba_offset_seeded)
+                plan_rows.append(
+                    [src, *ckpts(row, prev, src), new_owner, 0, dst, -1, 0]
+                )
+            for row, prev, high_col, threshold, previous_row in uncertain:
+                if not 0 <= prev < row_width:
+                    continue
+                src = int(bt[row, prev])
+                if src == 0:
+                    continue
+
+                def candidate(col: int, row=row, prev=prev, src=src) -> int:
+                    if col == prev or not 0 <= col < row_width:
+                        return 0
+                    dst = int(bt[row, col])
+                    return 0 if dst == src else dst
+
+                dst_lo = candidate(high_col - 1)
+                dst_hi = candidate(high_col)
+                if dst_lo == 0 and dst_hi == 0:
+                    continue
+                new_owner = int(req_ids[row] not in self._mamba_offset_seeded)
+                plan_rows.append(
+                    [
+                        src,
+                        *ckpts(row, prev, src),
+                        new_owner,
+                        dst_lo,
+                        dst_hi,
+                        previous_row,
+                        threshold,
+                    ]
+                )
+            if not plan_rows:
+                continue
+            key = tuple(id(raw) for raw in raws)
+            per_raw.setdefault(key, (raws, []))[1].extend(plan_rows)
+        if not per_raw:
+            return
+
+        offsets = self.mamba_slot_read_offsets
+        assert offsets is not None
+        num_rejected = (
+            previous.spec_decode_num_rejected_tokens
+            if uncertain
+            else None
+        )
+        if num_rejected is None:
+            # Only certain rows: the rejected count is never selected.
+            num_rejected = self._seed_zero_rejected()
+        elif num_rejected.shape[0] < self.max_num_reqs:
+            # One program shape per plan bucket, whatever the batch size.
+            num_rejected = torch.nn.functional.pad(
+                num_rejected, (0, self.max_num_reqs - num_rejected.shape[0])
+            )
+        single = len(per_raw) == 1
+        split = self._pool_block_split
+        reset_dsts: list[torch.Tensor] = []
+        for raws, plan_rows in per_raw.values():
+            n = self._bucket_len(len(plan_rows))
+            plan_cpu = torch.zeros((n, window + 6), dtype=torch.int32)
+            plan_cpu[: len(plan_rows)] = torch.tensor(plan_rows, dtype=torch.int32)
+            plan_dev = plan_cpu.to(self.device, non_blocking=True)
+            fn = (
+                _batched_spec_seed_compiled
+                if offsets.device.type == "tpu"
+                else _batched_spec_seed_impl
+            )
+            src_t, dst_t, dst_mgr = fn(offsets, plan_dev, num_rejected, split, single)
+            if not single:
+                reset_dsts.append(dst_mgr)
+            if split > 1:
+                src_t = self._pad_dev_to_bucket(src_t)
+                dst_t = self._pad_dev_to_bucket(dst_t)
+            self._pending_mamba_state_copies.append((raws, src_t, dst_t))
+        if reset_dsts:
+            # Several pool sets: reset only after every set read its sources.
+            _rollback_offsets_seed(
+                offsets, self._pad_dev_to_bucket(torch.cat(reset_dsts).long())
+            )
+
+    def _seed_zero_rejected(self) -> torch.Tensor:
+        zero = getattr(self, "_seed_zero_rejected_dev", None)
+        if zero is None:
+            zero = torch.zeros(self.max_num_reqs, dtype=torch.int32).to(self.device)
+            self._seed_zero_rejected_dev = zero
+        return zero
 
     @staticmethod
     def _bucket_len(n: int) -> int:
@@ -2569,6 +2850,7 @@ class TPUModelRunner(GPUModelRunner):
         )
         for req_id in invalidated_req_ids:
             self._mamba_state_pos.pop(req_id, None)
+            self._mamba_state_pos_pending.pop(req_id, None)
             slot = self._mamba_slot_by_req_id.pop(req_id, None)
             if slot is not None:
                 self._free_mamba_slots.append(slot)
@@ -6854,12 +7136,26 @@ class TPUModelRunner(GPUModelRunner):
                 else 0,
             )
             limit = self._bucket_len(num_groups * self.max_num_reqs)
+            batched_seed = (
+                envs.VLLM_TPU_BATCHED_MAMBA_SEED
+                and bool(self._mamba_copy_plan)
+                and self._mamba_ckpt_window > 1
+            )
+            rejected = self._seed_zero_rejected() if batched_seed else None
             n = 8
             while n <= limit:
                 src = torch.zeros(n, dtype=torch.long).to(offsets.device)
                 dst = torch.zeros(n, dtype=torch.long).to(offsets.device)
                 _rollback_offsets_seed_compiled(offsets, dst)
                 _rollback_offsets_migrate_compiled(offsets, src, dst)
+                if batched_seed:
+                    # All-zero plan rows seed the null block onto itself.
+                    plan = torch.zeros(
+                        (n, self._mamba_ckpt_window + 6), dtype=torch.int32
+                    ).to(offsets.device)
+                    _batched_spec_seed_compiled(
+                        offsets, plan, rejected, self._pool_block_split, True
+                    )
                 n *= 4
 
     def _warmup_spec_decode(self) -> None:
