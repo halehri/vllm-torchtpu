@@ -950,11 +950,17 @@ def _pooled_qsa(
             pool, len(q), len(ring_ids), main_slot if main_slot >= 0 else None
         )
     )
-    if not fused:
+    # DEBUG bisect knobs (temporary): which fused pieces run.
+    import os as _os
+
+    _parts = _os.environ.get("KVW_DBG_PARTS", "writer+ringread").split("+")
+    fused_read = fused and "ringread" in _parts
+    fused_writer = fused and "writer" in _parts
+    if not fused_writer:
         pool = write_main_cache(pool, rows_packed, page, logical, valid, **slot_kw)
     ring_rows = math.ceil(compress_ratio / 8) * 8
     ring_elements = ring_rows * raw.shape[-1]
-    read_state = read_ring_and_tags_concurrent if fused else read_ring_and_tags
+    read_state = read_ring_and_tags_concurrent if fused_read else read_ring_and_tags
     ring, tags = read_state(pool, ring_ids, ring_elements, ring_rows * 2)
     ring = ring.reshape(len(ring_ids), ring_rows, -1)
     tags = tags.reshape(len(ring_ids), ring_rows, 2)
@@ -975,7 +981,7 @@ def _pooled_qsa(
         rows_are_slots=fused,
     )
     ids = jnp.where(active, ring_ids, 0)
-    if fused:
+    if fused_writer:
         pair, write, mask, values = compressed_pairs(
             pool,
             completed,
@@ -1006,7 +1012,7 @@ def _pooled_qsa(
             ring_ids=ids,
             run_starts=starts[:-1],
             run_lengths=starts[1:] - starts[:-1],
-            run_length=max_query_len,
+            run_length=1 if "noruns" in _parts else max_query_len,
         )
     else:
         pool = write_compressed(
