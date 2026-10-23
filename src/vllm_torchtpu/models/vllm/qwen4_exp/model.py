@@ -48,7 +48,11 @@ from .config import (
     use_unified_pool,
 )
 from .gdn import Qwen4ExpGatedDeltaNetAttention
-from .hyperconnection import GatedResidual, HyperConnectionConfig
+from .hyperconnection import (
+    GatedResidual,
+    HyperConnectionConfig,
+    finalize_hyper_connections,
+)
 from .parallel import PLEParallel
 from .pd_identity import LoadedWeightIdentity
 from .ple import PLEInputs
@@ -648,6 +652,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         }
         if missing:
             raise ValueError(f"Incomplete Qwen4Exp checkpoint: {sorted(missing)}")
+        finalize_hyper_connections(self)
         if identity is not None:
             self.pd_loaded_weight_identity = identity.finish()
             self.pd_loaded_ple_identity = identity.finish(name_fragment=".ple.")

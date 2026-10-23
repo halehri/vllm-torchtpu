@@ -42,7 +42,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 from .config import mtp_layer_prefixes
-from .hyperconnection import GatedResidual
+from .hyperconnection import GatedResidual, finalize_hyper_connections
 from .model import (
     Qwen4ExpDecoderLayer,
     Qwen4ExpForCausalLM,
@@ -349,4 +349,5 @@ class Qwen4ExpMTP(nn.Module):
         }
         if missing:
             raise ValueError(f"Incomplete Qwen4Exp MTP checkpoint: {sorted(missing)}")
+        finalize_hyper_connections(self)
         return set(parameters)

@@ -258,3 +258,20 @@ def test_hc_tpu_negative_silu_preserves_mix_gate(compiled):
     with torch.inference_mode():
         actual = run(torch.ones(43, 10240, dtype=torch.bfloat16, device="tpu"))
     assert_metrics(_np(actual.cpu()), expected)
+
+
+@pytest.mark.parametrize("tokens", [3, 8])
+def test_hc_finalized_norm_scale_is_exact_and_used(tokens):
+    """The precomputed F32 (1 + w) gives bit-identical mixes, and is what is read."""
+    module, flat, _ = hc_fixture(True)
+    flat = flat[:1].expand(tokens, -1).contiguous() if tokens > 3 else flat
+    expected = module.mix(flat)[0]
+    module.finalize_weights()
+    assert module._norm_scale_ready
+    torch.testing.assert_close(module.mix(flat)[0], expected, rtol=0, atol=0)
+    # Positive control: a weight change is invisible until refinalized.
+    with torch.no_grad():
+        module.hc_norm.weight.mul_(3.0)
+    torch.testing.assert_close(module.mix(flat)[0], expected, rtol=0, atol=0)
+    module.finalize_weights()
+    assert not torch.equal(module.mix(flat)[0], expected)
