@@ -16,6 +16,8 @@ last-writer order of duplicate destinations by issuing those writes one at
 a time.
 """
 
+import os
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -31,6 +33,11 @@ MAX_FUSED_REQUESTS = 128
 
 _MAIN_READ, _COMP_READ, _MAIN_WRITE, _COMP_WRITE, _RING_WRITE = range(5)
 _RUN_READ, _RUN_WRITE = 5, 6
+
+
+def _per_dma_semaphores() -> bool:
+    # DEBUG bisect knob (temporary): one DMA semaphore per row/request.
+    return "persem" in os.environ.get("KVW_DBG_PARTS", "")
 
 
 def fused_write_supported(pool, tokens: int, requests: int, main_slot) -> bool:
@@ -195,16 +202,33 @@ def fused_layer_write(
         comp_buf,
         staged,
         sems,
+        *per_sems,
     ):
+        if per_sems:
+            main_sems, run_sems, comp_sems, ring_sems = per_sems
+
+            def sem(kind, i):
+                if kind in (_MAIN_READ, _MAIN_WRITE):
+                    return main_sems.at[i]
+                if kind in (_RUN_READ, _RUN_WRITE):
+                    return run_sems.at[i]
+                if kind in (_COMP_READ, _COMP_WRITE):
+                    return comp_sems.at[i]
+                return ring_sems.at[i]
+        else:
+
+            def sem(kind, i):
+                return sems.at[kind]
+
         def main_copy(i, read):
             stored = target_ref.at[page_ref[i], pl.ds(offset_ref[i], 1)]
             if read:
                 return pltpu.make_async_copy(
-                    stored, main_buf.at[pl.ds(i, 1)], sems.at[_MAIN_READ]
+                    stored, main_buf.at[pl.ds(i, 1)], sem(_MAIN_READ, i)
                 )
             source = main_buf if paired else rows_ref
             return pltpu.make_async_copy(
-                source.at[pl.ds(i, 1)], stored, sems.at[_MAIN_WRITE]
+                source.at[pl.ds(i, 1)], stored, sem(_MAIN_WRITE, i)
             )
 
         def run_copy(r, read):
@@ -213,13 +237,13 @@ def fused_layer_write(
                 return pltpu.make_async_copy(
                     stored,
                     main_buf.at[pl.ds(run_tok_ref[r], run_length)],
-                    sems.at[_RUN_READ],
+                    sem(_RUN_READ, r),
                 )
             source = main_buf if paired else rows_ref
             return pltpu.make_async_copy(
                 source.at[pl.ds(run_tok_ref[r], run_length)],
                 stored,
-                sems.at[_RUN_WRITE],
+                sem(_RUN_WRITE, r),
             )
 
         def comp_copy(i, read):
@@ -227,14 +251,14 @@ def fused_layer_write(
             staged_pair = comp_buf.at[i]
             source, dest = (stored, staged_pair) if read else (staged_pair, stored)
             return pltpu.make_async_copy(
-                source, dest, sems.at[_COMP_READ if read else _COMP_WRITE]
+                source, dest, sem(_COMP_READ if read else _COMP_WRITE, i)
             )
 
         def ring_copy(lane):
             return pltpu.make_async_copy(
                 staged.at[lane],
                 target_ref.at[ids_ref[lane], pl.ds(0, state_tokens)],
-                sems.at[_RING_WRITE],
+                sem(_RING_WRITE, lane),
             )
 
         def each(n, predicate, action):
@@ -339,6 +363,16 @@ def fused_layer_write(
                 pltpu.VMEM((max(comp_tokens, 1), packing, width), pool.dtype),
                 pltpu.VMEM((count, state_tokens, *payload), pool.dtype),
                 pltpu.SemaphoreType.DMA((7,)),
+                *(
+                    [
+                        pltpu.SemaphoreType.DMA((tokens,)),
+                        pltpu.SemaphoreType.DMA((runs,)),
+                        pltpu.SemaphoreType.DMA((max(comp_tokens, 1),)),
+                        pltpu.SemaphoreType.DMA((count,)),
+                    ]
+                    if _per_dma_semaphores()
+                    else []
+                ),
             ],
         ),
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
@@ -377,12 +411,14 @@ def read_ring_and_tags_concurrent(
     payload = tuple(pool.shape[2:])
     lanes = pool.shape[-1]
 
+    per = _per_dma_semaphores()
+
     def kernel(indices, source, ring_out, tags_out, staged, semaphore):
         def copy(lane):
             return pltpu.make_async_copy(
                 source.at[jnp.maximum(indices[lane], 0), pl.ds(0, tokens)],
                 staged.at[lane],
-                semaphore,
+                semaphore.at[lane] if per else semaphore,
             )
 
         for lane in range(count):
@@ -409,7 +445,7 @@ def read_ring_and_tags_concurrent(
             ],
             scratch_shapes=[
                 pltpu.VMEM((count, tokens, *payload), pool.dtype),
-                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.DMA((count,)) if per else pltpu.SemaphoreType.DMA,
             ],
         ),
         out_shape=[
