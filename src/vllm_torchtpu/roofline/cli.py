@@ -22,6 +22,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 
 from .chips import CHIPS
+from .gap import compare_measured
 from .geometry import from_hf_config
 from .modules import Dtypes, Parallel, StepShape
 from .serving import plan
@@ -68,7 +69,7 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the roofline plan or explain subcommand."""
+    """Run the roofline plan, explain, or gap subcommand."""
     parser = argparse.ArgumentParser(prog="python -m vllm_torchtpu.roofline")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -83,6 +84,15 @@ def main(argv: list[str] | None = None) -> int:
     p_exp.add_argument("--batch", type=int, default=1)
     p_exp.add_argument("--rows-per-seq", type=int, default=1)
     p_exp.add_argument("--spec-window", type=int, default=0)
+
+    p_gap = sub.add_parser("gap")
+    _add_common_args(p_gap)
+    p_gap.add_argument("--measured", required=True, help="Path to measured JSON")
+    p_gap.add_argument("--batch", type=int, default=1)
+    p_gap.add_argument("--rows-per-seq", type=int, default=1)
+    p_gap.add_argument("--spec-window", type=int, default=0)
+    p_gap.add_argument("--sub-floor-tol", type=float, default=0.02)
+    p_gap.add_argument("--fail-on-sub-floor", action="store_true")
 
     args = parser.parse_args(argv)
     if args.tp <= 0:
@@ -142,6 +152,50 @@ def main(argv: list[str] | None = None) -> int:
                 f"{r.output_tput_ceil_per_chip:>25.1f}  {r.flag:<7}\n"
             )
             sys.stdout.write(line)
+        return 0
+
+    if args.cmd == "gap":
+        measured_raw = json.loads(Path(args.measured).read_text())
+        if args.spec_window > 0:
+            sf = spec_cycle_floor(
+                geom, chip, par, args.batch, args.context, args.spec_window, dt
+            )
+        else:
+            sf = step_floor(
+                geom=geom,
+                chip=chip,
+                par=par,
+                shape=StepShape(
+                    batch=args.batch,
+                    rows_per_seq=args.rows_per_seq,
+                    context=args.context,
+                ),
+                dt=dt,
+            )
+        rep = compare_measured(
+            sf, chip, measured_raw, sub_floor_tol_ratio=args.sub_floor_tol
+        )
+        if args.json:
+            sys.stdout.write(json.dumps(asdict(rep)) + "\n")
+        else:
+            sys.stdout.write(
+                f"{'module':<12}  {'floor_ms':>9}  {'measured_ms':>11}  "
+                f"{'gap_ms':>8}  {'util':>7}  {'gap_share':>9}  {'status':<20}\n"
+            )
+            for m in rep.modules:
+                sys.stdout.write(
+                    f"{m.name:<12}  {m.floor_ms:>9.3f}  {m.measured_ms:>11.3f}  "
+                    f"{m.gap_ms:>8.3f}  {m.achieved_util * 100:>6.1f}%  "
+                    f"{m.gap_share * 100:>8.1f}%  {m.status:<20}\n"
+                )
+            sys.stdout.write(
+                f"TOTAL         {rep.hard_floor_ms:>9.3f}  "
+                f"{rep.measured_step_ms:>11.3f}  {rep.total_gap_ms:>8.3f}  "
+                f"{rep.achieved_step_util * 100:>6.1f}%  "
+                f"unattrib={rep.unattributed_ms:.3f}ms  {rep.status}\n"
+            )
+        if args.fail_on_sub_floor and rep.status == "SUB_FLOOR_MODEL_BUG":
+            return 2
         return 0
 
     if args.spec_window > 0:
