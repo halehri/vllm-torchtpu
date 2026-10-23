@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE: bool = False
+    VLLM_TPU_QSA_DECODE_LEAN_FETCH: bool = False
     VLLM_TPU_QSA_FUSED_KV_WRITE: bool = False
     VLLM_TPU_QSA_INDEXER_SHARD: bool = False
     VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS: int = 0
@@ -482,6 +483,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # schedule once per step; RPA also skips its empty mixed pass.
     "VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE": env_bool(
         "VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE", default=False
+    ),
+    # Qwen4-exp QSA decode/verify attention on RPA: fetch each KV page with
+    # one scalar load instead of three (the decode KV fetch issues one DMA
+    # per 4-token group and is scalar-issue bound). Same DMAs and results.
+    "VLLM_TPU_QSA_DECODE_LEAN_FETCH": env_bool(
+        "VLLM_TPU_QSA_DECODE_LEAN_FETCH", default=False
     ),
     # Qwen4-exp pooled QSA decode/verify steps: write main KV, compressed
     # indexer keys and the raw ring/tags of a layer with one Pallas kernel
