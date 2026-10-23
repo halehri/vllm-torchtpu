@@ -35,7 +35,7 @@ from .modules import (
     pass_costs,
 )
 from .recipe import plan_from_serve_args
-from .serving import PlanRow, plan
+from .serving import ConcurrencyRow, plan
 from .step import StepFloor, spec_cycle_floor, step_floor
 
 __all__ = [
@@ -48,7 +48,7 @@ __all__ = [
     "ModuleGap",
     "Parallel",
     "PlanReconciliation",
-    "PlanRow",
+    "ConcurrencyRow",
     "StepFloor",
     "StepGapReport",
     "StepShape",
