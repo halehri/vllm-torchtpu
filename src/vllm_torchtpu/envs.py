@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
+    TPU_RPA_DECODE_BATCHED: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
@@ -729,6 +730,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Skip padded tokens from MoE, otherwise they will route like
     # real tokens and activate experts whose output is thrown away.
     "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    # Run qwen4_exp QSA's batched RPA decode programs of up to 64 query rows
+    # with half the chip's VMEM, leaving the rest for the compiler to prefetch
+    # the next layers' weights across the kernel.
+    "TPU_RPA_DECODE_BATCHED": env_bool("TPU_RPA_DECODE_BATCHED"),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is
