@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     QWEN4_EXP_PREFILL_SP: bool = False
     QWEN4_EXP_PREFILL_SP_MIN_TOKENS: int = 1024
     QWEN4_EXP_PREFILL_SP_MOE: bool = False
+    TPU_QWEN4_HC_DECODE_FUSED: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -675,6 +676,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rank's own rows on sequence-parallel steps (no replica split/restore)
     # and the shared expert's TP sum is reduce-scattered, not all-reduced.
     "QWEN4_EXP_PREFILL_SP_MOE": env_bool("QWEN4_EXP_PREFILL_SP_MOE"),
+    # qwen4_exp: run each hyper-connection mix (per-branch norm, low-rank
+    # gate, branch mean and the combine's injection gate) at <= 512 tokens as
+    # one Pallas call, with the attn combine fused ahead of the mlp mix.
+    "TPU_QWEN4_HC_DECODE_FUSED": env_bool("TPU_QWEN4_HC_DECODE_FUSED"),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
     # one-hot combine; "on" enables the kernel for every shape that passes

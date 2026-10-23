@@ -322,8 +322,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 reduce=False,
             )[0]
             block = sp.reduce(block, sequence_parallel)
-        hidden = self.attn_hyper_connection.combine(block, residual)
-        block, residual = self.mlp_hyper_connection.mix(hidden)
+        block, residual = self.attn_hyper_connection.combine_mix(
+            block, residual, self.mlp_hyper_connection
+        )
         # GDN may leave padded rows unwritten; MoE dispatch requires finite inputs.
         if sequence_parallel:
             valid_tokens = sp.shard(valid_tokens[:, None])[:, 0]
@@ -406,10 +407,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
             rows=rows,
         )[0]
         picked = rows.clamp_min(0)
-        hidden = self.attn_hyper_connection.combine(
-            block, (hyper_input[picked], normed[picked])
+        block, residual = self.attn_hyper_connection.combine_mix(
+            block, (hyper_input[picked], normed[picked]), self.mlp_hyper_connection
         )
-        block, residual = self.mlp_hyper_connection.mix(hidden)
         block = torch.where((rows >= 0)[:, None], block, 0)
         return self.mlp_hyper_connection.combine(self.mlp(block), residual)
 
