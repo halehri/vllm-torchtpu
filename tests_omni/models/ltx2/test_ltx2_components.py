@@ -28,7 +28,6 @@ Total runtime on TPU v7x: ~33s (6 test items).
 """
 
 import copy
-import os
 
 import pytest
 import torch
@@ -62,9 +61,9 @@ from vllm_omni.diffusion.models.ltx2.ltx2_transformer import (
 from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
 from vllm_omni.platforms import current_omni_platform
 
-from .utils import (
+from tests_omni.omni_test_utils import (
     assert_all_loaded,
-    assert_parity,
+    assert_within_bf16_noise,
     metrics,
 )
 
@@ -96,15 +95,14 @@ CONNECTOR_RATIO_GATES: dict[str, tuple[float, float]] = {
 def omni_ctx():
     """Diffusion parallel groups and forward context from OmniDiffusionConfig."""
     od_config = OmniDiffusionConfig()
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ["MASTER_PORT"] = str(od_config.master_port)
-    os.environ.setdefault("RANK", "0")
-    os.environ.setdefault("LOCAL_RANK", "0")
-    os.environ.setdefault("WORLD_SIZE", str(od_config.num_gpus))
-
     owns_dist = not torch.distributed.is_initialized()
     if owns_dist:
-        init_distributed_environment()
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method=f"tcp://127.0.0.1:{od_config.master_port}",
+        )
     owns_mp = not model_parallel_is_initialized()
     if owns_mp:
         initialize_model_parallel()
@@ -449,7 +447,7 @@ def test_ltx2_tiny_transformer_parity(
         ("audio", ref_audio, ref_bf16_audio, 1),
     ):
         fp32_ratio, bf16_ratio = DIT_RATIO_GATES[(variant, modality)]
-        assert_parity(
+        assert_within_bf16_noise(
             ref=ref_out,
             ref_bf16=ref_bf16_out,
             tpu_fp32=tpu_outputs[torch.float32][idx],
@@ -542,7 +540,7 @@ def test_ltx2_tiny_connectors_parity(
         ("audio", ref_audio, ref_bf16_audio, 1),
     ):
         fp32_ratio, bf16_ratio = CONNECTOR_RATIO_GATES[modality]
-        assert_parity(
+        assert_within_bf16_noise(
             ref=ref_out,
             ref_bf16=ref_bf16_out,
             tpu_fp32=tpu_outputs[torch.float32][idx],
