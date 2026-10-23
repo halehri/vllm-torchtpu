@@ -135,11 +135,6 @@ class GatedResidual(common_hc.GatedResidual):
             self._norm_scale_ready = True
 
 
-def finalize_hyper_connections(module: torch.nn.Module):
-    for child in module.modules():
-        if isinstance(child, GatedResidual):
-            child.finalize_weights()
-
     def mix(self, hyper_input):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if not hasattr(self, "input_mix_weight_down"):
@@ -224,6 +219,12 @@ def finalize_hyper_connections(module: torch.nn.Module):
             dim=-1,
         )
         return output.to(hyper_input.dtype)
+
+
+def finalize_hyper_connections(module: torch.nn.Module):
+    for child in module.modules():
+        if isinstance(child, GatedResidual):
+            child.finalize_weights()
 
 
 __all__ = [
