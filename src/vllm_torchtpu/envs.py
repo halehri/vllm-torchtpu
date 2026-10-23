@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
+    VLLM_TPU_GDN_HOIST_READ_OFFSETS: bool = False
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
@@ -465,6 +466,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of 128). Only read when VLLM_TPU_QSA_DECODE_QUERY_BLOCK > 0.
     "VLLM_TPU_QSA_DECODE_KV_BLOCK": env_nonnegative_int(
         "VLLM_TPU_QSA_DECODE_KV_BLOCK", 1024
+    ),
+    # Pooled GDN with speculative decoding: gather each sequence's checkpoint
+    # read offset (slot_read_offsets[state_indices]) in the step graph rather
+    # than inside every layer's op, so XLA keeps one gather per step.
+    "VLLM_TPU_GDN_HOIST_READ_OFFSETS": env_bool(
+        "VLLM_TPU_GDN_HOIST_READ_OFFSETS", default=False
     ),
     # Qwen4-exp QSA decode/verify attention: run the decode rows (and the
     # decode prefix of mixed steps) on the fused sparse GQA decode kernel

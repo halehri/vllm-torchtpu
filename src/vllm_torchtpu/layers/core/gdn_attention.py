@@ -961,8 +961,13 @@ def run_jax_gdn_attention_pooled(
     conv_state_dtype: jnp.dtype = jnp.bfloat16,
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
+    read_offsets_per_seq: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
+
+    ``read_offsets_per_seq``: ``slot_read_offsets`` is already indexed by
+    ``state_indices`` (one offset per sequence), e.g. gathered once per step
+    by the caller for every GDN layer, instead of the per-block buffer.
 
     Args:
         j_mixed_qkv: Input tensor of shape `(num_tokens, dim)`.
@@ -1071,7 +1076,11 @@ def run_jax_gdn_attention_pooled(
     # `state_indices[s]`. Both operands are replicated, so gather here,
     # outside the shard_map (mirrors run_jax_gdn_attention).
     if slot_read_offsets is not None:
-        extra_args = (slot_read_offsets[state_indices],)
+        extra_args = (
+            slot_read_offsets
+            if read_offsets_per_seq
+            else slot_read_offsets[state_indices],
+        )
     else:
         extra_args = ()
     if ckpt_indices is not None:
