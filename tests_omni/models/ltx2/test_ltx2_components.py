@@ -76,18 +76,19 @@ ROPE_MAX_ABS_ERR: dict[str, float] = {"video": 1.6e-4, "audio": 1.0e-3}
 ROPE_MAX_REL_L2: dict[str, float] = {"video": 4.8e-5, "audio": 5.3e-5}
 
 # Per-(variant, modality) error ratios (omni_rel_l2 / diffusers_cpu_bf16_rel_l2),
-# tightened to ~2.5-3% above the observed TPU v7x ratios.
+# ~3% above the observed TPU v7x ratios, rounded up to 0.01. The ratios repeat
+# exactly across runs (vllm-omni 0.32.0rc1).
 DIT_RATIO_GATES: dict[tuple[str, str], tuple[float, float]] = {
-    ("t2v", "video"): (0.60, 1.12),
-    ("t2v", "audio"): (0.54, 1.17),
-    ("stg", "video"): (0.61, 1.12),
-    ("stg", "audio"): (0.58, 1.15),
-    ("modality", "video"): (0.63, 1.10),
-    ("modality", "audio"): (0.56, 1.09),
+    ("t2v", "video"): (0.46, 0.99),
+    ("t2v", "audio"): (0.44, 1.02),
+    ("stg", "video"): (0.45, 0.94),
+    ("stg", "audio"): (0.52, 1.07),
+    ("modality", "video"): (0.52, 1.11),
+    ("modality", "audio"): (0.53, 1.06),
 }
 CONNECTOR_RATIO_GATES: dict[str, tuple[float, float]] = {
-    "video": (0.65, 1.10),
-    "audio": (0.67, 1.09),
+    "video": (0.49, 1.05),
+    "audio": (0.51, 1.05),
 }
 
 
