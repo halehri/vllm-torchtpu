@@ -291,3 +291,71 @@ def test_ngram_history_uses_configured_width_and_eos():
         store, torch.tensor([0, 0]), torch.tensor([1, 4]), eos_token_id=7, ngram_size=4
     )
     assert history.tolist() == [[7, 7, 11], [12, 13, 14]]
+
+
+@pytest.mark.parametrize("ngram_size", [2, 3, 4])
+@pytest.mark.parametrize("spec", [0, 1, 3])
+def test_ngram_window_matches_full_store(monkeypatch, ngram_size, spec):
+    """The narrow per-row window reads exactly what the whole store would,
+    for every device context the previous step's rejections can produce."""
+    import numpy as np
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.inputs import ngram_window_from_host
+
+    gen = torch.Generator().manual_seed(ngram_size * 10 + spec)
+    rows, model_len = 6, 40
+    store = torch.randint(1, 1000, (rows, model_len), dtype=torch.int32, generator=gen)
+    width = ngram_size - 1 + spec
+    packed = torch.zeros((rows, 1 + width), dtype=torch.int32)
+    for trial in range(50):
+        num_rows = int(torch.randint(0, rows + 1, (1,), generator=gen))
+        host_ctx = np.asarray(
+            torch.randint(0, model_len, (rows,), generator=gen), dtype=np.int32
+        )
+        ngram_window_from_host(store.numpy(), host_ctx, num_rows, width, packed)
+        rejected = torch.randint(0, spec + 1, (rows,), generator=gen)
+        context = (torch.from_numpy(host_ctx).long() - rejected).clamp(min=0)
+        row_ids = torch.randperm(rows, generator=gen)[: max(num_rows, 1)]
+        row_ids = row_ids[row_ids < max(num_rows, 1)] if num_rows else row_ids[:0]
+        expected = ngram_context_from_store(
+            store, row_ids, context[row_ids], 7, ngram_size
+        )
+        actual = ngram_context_from_store(
+            packed[:, 1:], row_ids, context[row_ids], 7, ngram_size, packed[:, 0]
+        )
+        assert torch.equal(actual, expected), trial
+
+
+def test_begin_step_uploads_window_when_batch_has_counts(monkeypatch):
+    import numpy as np
+
+    host = torch.arange(1, 31, dtype=torch.int32).reshape(3, 10)
+    batch = NS(
+        token_ids_cpu_tensor=host,
+        token_ids_cpu=host.numpy(),
+        num_computed_tokens_cpu=np.array([5, 1, 9], dtype=np.int32),
+        num_reqs=2,
+    )
+    runner = NS(device="cpu", input_batch=batch)
+    runner.model_config = NS(hf_text_config=q4exp_text_config())
+    runner.cache_config = NS(block_size=128)
+    adapter = Qwen4ExpAdapter(runner)
+    store = adapter.begin_step()
+    width = adapter.config.ngram_size - 1
+    assert store.shape == (3, width)
+    assert adapter.window_base.tolist()[:2] == [5 - width, 1 - width]
+    history = ngram_context_from_store(
+        store,
+        torch.arange(2),
+        torch.tensor([5, 1]),
+        eos_token_id=7,
+        ngram_size=adapter.config.ngram_size,
+        column_base=adapter.window_base,
+    )
+    full = ngram_context_from_store(
+        host, torch.arange(2), torch.tensor([5, 1]), 7, adapter.config.ngram_size
+    )
+    assert history.tolist() == full.tolist()
+    monkeypatch.setenv("VLLM_TPU_QWEN4_NGRAM_WINDOW", "0")
+    assert adapter.begin_step().shape == host.shape
+    assert adapter.window_base is None

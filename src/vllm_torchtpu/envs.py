@@ -183,6 +183,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FUSED_ASYNC_DRAFT_SEED: bool = True
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
     VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE: bool = True
+    VLLM_TPU_QWEN4_NGRAM_WINDOW: bool = True
     VLLM_TPU_MTP_DRAFT_ROWS: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
@@ -1146,6 +1147,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # stage_block_table_uploads).
     "VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE": env_bool(
         "VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE", default=True
+    ),
+    # Qwen4Exp PLE: upload each row's last ngram_size - 1 + K host tokens per
+    # step instead of the whole [max_num_reqs, max_model_len] token store
+    # (32 MB at 32 x 256K), the only part the n-gram history reads.
+    "VLLM_TPU_QWEN4_NGRAM_WINDOW": env_bool(
+        "VLLM_TPU_QWEN4_NGRAM_WINDOW", default=True
     ),
     # MTP draft step 0 on a draft declaring `supports_draft_rows` (Qwen4Exp):
     # write the draft layer's caches for every token of the target's step but

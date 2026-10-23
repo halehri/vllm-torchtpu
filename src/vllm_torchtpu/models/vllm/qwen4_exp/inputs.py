@@ -5,6 +5,7 @@ import math
 import time
 from typing import TYPE_CHECKING, cast
 
+import numpy as np
 import torch
 from vllm.forward_context import set_forward_context
 
@@ -23,13 +24,52 @@ if TYPE_CHECKING:
 
 
 def ngram_context_from_store(
-    token_store, row_indices, context_lens, eos_token_id, ngram_size
+    token_store, row_indices, context_lens, eos_token_id, ngram_size, column_base=None
 ):
+    """The ``ngram_size - 1`` tokens before each row's context end.
+
+    ``token_store`` is either the whole per-row token history (column ``c``
+    holds position ``c``) or, with ``column_base``, a narrow per-row window
+    whose column ``j`` holds position ``column_base[row] + j``
+    (`ngram_window_from_host`). Positions before 0 read ``eos_token_id``.
+    """
     columns = context_lens[:, None] + torch.arange(
         1 - ngram_size, 0, dtype=torch.int64, device=token_store.device
     )
-    gathered = token_store[row_indices[:, None], columns.clamp(min=0)]
+    if column_base is None:
+        gathered = token_store[row_indices[:, None], columns.clamp(min=0)]
+    else:
+        index = columns - column_base[row_indices][:, None].to(torch.int64)
+        gathered = torch.gather(
+            token_store[row_indices], 1, index.clamp(0, token_store.shape[1] - 1)
+        )
     return torch.where(columns >= 0, gathered.to(torch.int64), eos_token_id)
+
+
+def ngram_window_from_host(token_ids, num_computed, num_rows, width, out):
+    """Pack each live row's last ``width`` host tokens before its context.
+
+    PLE history only reads the ``ngram_size - 1`` tokens before a row's
+    context end. On the device that end is the host's optimistic
+    ``num_computed_tokens`` minus the previous step's rejected drafts (at most
+    ``num_speculative_tokens``), so a ``ngram_size - 1 + K`` window ending at
+    the host context covers every position the device can read. Uploading it
+    replaces a whole ``[max_num_reqs, max_model_len]`` store snapshot per step.
+
+    ``out`` is ``[rows, 1 + width]`` int32: column 0 the window's first
+    position (may be negative), columns ``1..`` the tokens (0 where the
+    position is negative; those read EOS). Rows past ``num_rows`` are zero.
+    """
+    out.zero_()
+    if num_rows == 0:
+        return out
+    base = num_computed[:num_rows].astype(np.int64) - width
+    positions = base[:, None] + np.arange(width, dtype=np.int64)[None]
+    np.clip(positions, 0, token_ids.shape[1] - 1, out=positions)
+    view = out.numpy()
+    view[:num_rows, 0] = base
+    view[:num_rows, 1:] = np.take_along_axis(token_ids[:num_rows], positions, axis=1)
+    return out
 
 
 def merge_recent_ngram_context(
@@ -94,6 +134,20 @@ class Qwen4ExpAdapter:
         self._recent: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         self._previous_rows: dict[str, int] = {}
         self._current_rows: dict[str, int] = {}
+        # Narrow per-row n-gram window instead of the whole token store; see
+        # `ngram_window_from_host`.
+        self.window_base: torch.Tensor | None = None
+        self._window_host: torch.Tensor | None = None
+
+    def _use_ngram_window(self, batch) -> bool:
+        from vllm_torchtpu import envs
+
+        return (
+            envs.VLLM_TPU_QWEN4_NGRAM_WINDOW
+            and hasattr(batch, "num_computed_tokens_cpu")
+            and hasattr(batch, "token_ids_cpu")
+            and hasattr(batch, "num_reqs")
+        )
 
     def bind_model(self, model):
         if self.pooled:
@@ -168,9 +222,32 @@ class Qwen4ExpAdapter:
         # Exactly one immutable H2D snapshot after runner request reordering.
         # Row numbers in this store are unrelated to state slots/page IDs.
         batch = self.runner.input_batch
-        self.token_store = batch.token_ids_cpu_tensor.to(
-            self.runner.device, non_blocking=True
-        )
+        self.window_base = None
+        if self._use_ngram_window(batch):
+            # Only each row's last few tokens are ever read (see
+            # `ngram_window_from_host`); upload those, not the whole store.
+            store_rows = batch.token_ids_cpu_tensor.shape[0]
+            width = self.config.ngram_size - 1 + max(self.spec_window - 1, 0)
+            packed = self._window_host
+            if packed is None or packed.shape != (store_rows, 1 + width):
+                packed = torch.zeros((store_rows, 1 + width), dtype=torch.int32)
+                self._window_host = packed
+            ngram_window_from_host(
+                batch.token_ids_cpu,
+                batch.num_computed_tokens_cpu,
+                batch.num_reqs,
+                width,
+                packed,
+            )
+            # `clone` so the non-blocking upload never reads a host buffer the
+            # next step rewrites.
+            packed_dev = packed.clone().to(self.runner.device, non_blocking=True)
+            self.window_base = packed_dev[:, 0]
+            self.token_store = packed_dev[:, 1:]
+        else:
+            self.token_store = batch.token_ids_cpu_tensor.to(
+                self.runner.device, non_blocking=True
+            )
         if self.spec_window:
             self._previous_rows, self._current_rows = self._current_rows, {}
             self._recent.reverse()
@@ -253,6 +330,11 @@ class Qwen4ExpAdapter:
             context,
             self.config.eos_token_id,
             self.config.ngram_size,
+            column_base=(
+                self.window_base
+                if snapshot.token_store is self.token_store
+                else None
+            ),
         )
         if self.spec_window:
             history = self._speculative_ngram_context(
@@ -367,6 +449,7 @@ class Qwen4ExpAdapter:
         self.token_store = torch.zeros_like(
             runner.input_batch.token_ids_cpu_tensor, device="cpu"
         ).to(runner.device)
+        self.window_base = None
         history = ngram_context_from_store(
             self.token_store,
             torch.arange(num_reqs, device=runner.device, dtype=torch.int64),
