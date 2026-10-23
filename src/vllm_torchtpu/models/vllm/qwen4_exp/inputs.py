@@ -106,6 +106,92 @@ def merge_recent_ngram_context(
     return torch.where(usable, gathered, history)
 
 
+def fused_ple_prepare(
+    starts,
+    seq_lens,
+    store,
+    meta,
+    input_ids,
+    state_indices,
+    previous,
+    current,
+    eos_token_id: int,
+    ngram_size: int,
+    spec_window: int,
+    windowed: bool,
+    num_tokens: int,
+):
+    """`Qwen4ExpAdapter.prepare_inputs`'s device work as one function, so the
+    TPU runs it as one compiled program instead of ~25 eager ones.
+
+    ``meta`` is ``[rows + 2]`` int64: each row's row in the previous step's
+    record (-1 if none; ignored without speculative decoding), then
+    ``row_start`` and ``num_requests`` — values, not shapes. ``store`` is the
+    step's token snapshot; with ``windowed`` it is the packed
+    ``[rows, 1 + width]`` window whose column 0 is each row's first position
+    (see `ngram_window_from_host`). ``state_indices`` None means the pooled
+    layout (row ids). ``previous``/``current`` are the speculative n-gram
+    records; ``current`` is updated in place. Returns
+    ``(context_lens, state_slots, ngram_context, valid_tokens)``.
+    """
+    rows = starts.shape[0] - 1
+    device = starts.device
+    row_start = meta[rows]
+    num_requests = meta[rows + 1]
+    context = (seq_lens - (starts[1:] - starts[:-1])).to(torch.int64)
+    row_index = torch.arange(rows, dtype=torch.int64, device=device)
+    valid_rows = row_index < num_requests
+    if state_indices is None:
+        state_indices = torch.arange(rows, dtype=torch.int32, device=device)
+    slots = torch.where(valid_rows, state_indices, -1).to(torch.int32)
+    row_ids = (row_index + row_start).clamp(max=store.shape[0] - 1)
+    if windowed:
+        history = ngram_context_from_store(
+            store[:, 1:], row_ids, context, eos_token_id, ngram_size, store[:, 0]
+        )
+    else:
+        history = ngram_context_from_store(
+            store, row_ids, context, eos_token_id, ngram_size
+        )
+    if spec_window:
+        history = merge_recent_ngram_context(
+            history, *previous, meta[:rows], context
+        )
+        tokens, recent_context, lengths = current
+        ids = input_ids.to(torch.int64)
+        offsets = torch.arange(spec_window, device=device)
+        chunk = ids[
+            (starts[:-1, None].to(torch.int64) + offsets).clamp(0, ids.shape[0] - 1)
+        ]
+        target = torch.where(valid_rows, row_index + row_start, tokens.shape[0] - 1)
+        lengths_now = (starts[1:] - starts[:-1]).to(torch.int64)
+        tokens.index_copy_(0, target, torch.cat([history, chunk], dim=1))
+        recent_context.index_copy_(0, target, context)
+        lengths.index_copy_(0, target, lengths_now.clamp(max=spec_window))
+    valid_tokens = torch.arange(num_tokens, device=device) < starts[-1]
+    return context, slots, history, valid_tokens
+
+
+def _unmark_dynamic(value):
+    """A view of a tensor carrying dynamo's dynamic-dim stamp, so a static
+    region never lifts a SymInt (see eagle3._static_shape_args: the model
+    forward marks `input_ids` dynamic on the tensor object itself)."""
+    if isinstance(value, torch.Tensor):
+        return value[:] if getattr(value, "_dynamo_dynamic_indices", None) else value
+    if isinstance(value, tuple):
+        return tuple(_unmark_dynamic(v) for v in value)
+    return value
+
+
+_fused_ple_prepare_inner = torch.compile(
+    backend="tpu", fullgraph=True, dynamic=False
+)(fused_ple_prepare)
+
+
+def _fused_ple_prepare_compiled(*args):
+    return _fused_ple_prepare_inner(*[_unmark_dynamic(a) for a in args])
+
+
 def dummy_query_lengths(num_tokens, num_reqs, max_active):
     active = min(num_tokens, num_reqs, max_active)
     lengths = [1] * active + [0] * (num_reqs - active)
@@ -138,6 +224,7 @@ class Qwen4ExpAdapter:
         # `ngram_window_from_host`.
         self.window_base: torch.Tensor | None = None
         self._window_host: torch.Tensor | None = None
+        self._window_packed: torch.Tensor | None = None
 
     def _use_ngram_window(self, batch) -> bool:
         from vllm_torchtpu import envs
@@ -242,9 +329,11 @@ class Qwen4ExpAdapter:
             # `clone` so the non-blocking upload never reads a host buffer the
             # next step rewrites.
             packed_dev = packed.clone().to(self.runner.device, non_blocking=True)
+            self._window_packed = packed_dev
             self.window_base = packed_dev[:, 0]
             self.token_store = packed_dev[:, 1:]
         else:
+            self._window_packed = None
             self.token_store = batch.token_ids_cpu_tensor.to(
                 self.runner.device, non_blocking=True
             )
@@ -306,7 +395,74 @@ class Qwen4ExpAdapter:
         lengths.index_copy_(0, target, lengths_now.clamp(max=self.spec_window))
         return history
 
+    def _prepare_inputs_fused(self, snapshot):
+        """`prepare_inputs` with the device work in `fused_ple_prepare`."""
+        runner = self.runner
+        ctx = runner._attn_metadata_builder_ctx
+        starts = ctx.query_start_loc
+        rows = starts.shape[0] - 1
+        meta = torch.full((rows + 2,), -1, dtype=torch.int64)
+        previous = current = None
+        if self.spec_window:
+            req_ids = runner.input_batch.req_ids
+            for i in range(snapshot.num_requests):
+                req_id = req_ids[snapshot.row_start + i]
+                meta[i] = self._previous_rows.get(req_id, -1)
+                self._current_rows[req_id] = snapshot.row_start + i
+            previous, current = self._recent_buffers(runner.device)
+        meta[rows] = snapshot.row_start
+        meta[rows + 1] = snapshot.num_requests
+        windowed = (
+            self._window_packed is not None
+            and snapshot.token_store is self.token_store
+        )
+        store = self._window_packed if windowed else snapshot.token_store
+        fn = (
+            _fused_ple_prepare_compiled
+            if starts.device.type == "tpu"
+            else fused_ple_prepare
+        )
+        context, slots, history, valid_tokens = fn(
+            starts,
+            ctx.seq_lens,
+            store,
+            meta.to(runner.device, non_blocking=True),
+            snapshot.input_ids,
+            None if self.pooled else ctx.mamba_state_indices,
+            previous,
+            current,
+            self.config.eos_token_id,
+            self.config.ngram_size,
+            self.spec_window,
+            windowed,
+            snapshot.num_tokens,
+        )
+        return self._model_kwargs(snapshot, rows, starts, history, slots, context, valid_tokens)
+
+    def _model_kwargs(
+        self, snapshot, rows, starts, history, slots, context, valid_tokens
+    ):
+        tables = []
+        attention = f"{self.attention_prefix}.self_attn"
+        for name in (self._main_owner(attention), self._compressed_owner(attention)):
+            # Metadata uses the genuine native group table, never state slots.
+            table = snapshot.attention_metadata[name].block_tables.reshape(rows, -1)
+            tables.append(table)
+        return dict(
+            query_start_loc=starts,
+            ngram_context=history,
+            state_slots=slots,
+            context_lens=context,
+            valid_tokens=valid_tokens,
+            main_block_table=tables[0],
+            compressed_block_table=tables[1],
+        )
+
     def prepare_inputs(self, snapshot):
+        from vllm_torchtpu import envs
+
+        if envs.VLLM_TPU_QWEN4_FUSED_PLE_PREP:
+            return self._prepare_inputs_fused(snapshot)
         runner = self.runner
         ctx = runner._attn_metadata_builder_ctx
         starts = ctx.query_start_loc
@@ -340,23 +496,15 @@ class Qwen4ExpAdapter:
             history = self._speculative_ngram_context(
                 snapshot, history, context, starts
             )
-        tables = []
-        attention = f"{self.attention_prefix}.self_attn"
-        for name in (self._main_owner(attention), self._compressed_owner(attention)):
-            # Metadata uses the genuine native group table, never state slots.
-            table = snapshot.attention_metadata[name].block_tables.reshape(rows, -1)
-            tables.append(table)
-        kwargs = dict(
-            query_start_loc=starts,
-            ngram_context=history,
-            state_slots=slots,
-            context_lens=context,
-            valid_tokens=torch.arange(snapshot.num_tokens, device=runner.device)
-            < starts[-1],
-            main_block_table=tables[0],
-            compressed_block_table=tables[1],
+        return self._model_kwargs(
+            snapshot,
+            rows,
+            starts,
+            history,
+            slots,
+            context,
+            torch.arange(snapshot.num_tokens, device=runner.device) < starts[-1],
         )
-        return kwargs
 
     def dummy_run(
         self, num_tokens, num_reqs, profile_prefix=None, *, dp_lockstep=False
@@ -450,6 +598,7 @@ class Qwen4ExpAdapter:
             runner.input_batch.token_ids_cpu_tensor, device="cpu"
         ).to(runner.device)
         self.window_base = None
+        self._window_packed = None
         history = ngram_context_from_store(
             self.token_store,
             torch.arange(num_reqs, device=runner.device, dtype=torch.int64),

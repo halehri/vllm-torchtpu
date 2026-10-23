@@ -359,3 +359,74 @@ def test_begin_step_uploads_window_when_batch_has_counts(monkeypatch):
     monkeypatch.setenv("VLLM_TPU_QWEN4_NGRAM_WINDOW", "0")
     assert adapter.begin_step().shape == host.shape
     assert adapter.window_base is None
+
+
+@pytest.mark.parametrize("pooled", [False, True])
+@pytest.mark.parametrize("window", [False, True])
+@pytest.mark.parametrize("spec", [0, 3])
+def test_fused_ple_prepare_matches_eager(monkeypatch, pooled, window, spec):
+    """The single-program PLE preparation returns the same kwargs and leaves
+    the same speculative record as the eager path, step after step."""
+    import numpy as np
+
+    monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", str(int(pooled)))
+    monkeypatch.setenv("VLLM_TPU_QWEN4_NGRAM_WINDOW", str(int(window)))
+    gen = torch.Generator().manual_seed(spec * 4 + pooled * 2 + window)
+    rows, model_len, num_tokens = 4, 64, 16
+
+    def make_adapter():
+        host = torch.randint(
+            1, 500, (rows, model_len), dtype=torch.int32, generator=torch.Generator().manual_seed(1)
+        )
+        batch = NS(
+            token_ids_cpu_tensor=host,
+            token_ids_cpu=host.numpy(),
+            num_computed_tokens_cpu=np.zeros(rows, dtype=np.int32),
+            num_reqs=3,
+            req_ids=["a", "b", "c", None],
+        )
+        runner = NS(device="cpu", input_batch=batch, max_num_reqs=rows)
+        runner.model_config = NS(hf_text_config=q4exp_text_config())
+        runner.cache_config = NS(block_size=128)
+        runner.vllm_config = NS(
+            speculative_config=NS(num_speculative_tokens=spec) if spec else None,
+            model_config=runner.model_config,
+        )
+        return Qwen4ExpAdapter(runner), runner
+
+    eager, eager_runner = make_adapter()
+    fused, fused_runner = make_adapter()
+    name = eager.attention_prefix + ".self_attn"
+    metadata = {
+        name: NS(block_tables=torch.arange(rows * 2)),
+        name + ".compressed_k": NS(block_tables=torch.arange(rows * 2) + 50),
+    }
+    for step in range(4):
+        computed = torch.randint(5, 40, (rows,), generator=gen)
+        q = torch.tensor([1 + spec, 1, 1 + spec, 0])
+        starts = torch.cat([torch.zeros(1, dtype=torch.int64), q.cumsum(0)]).int()
+        rejected = torch.randint(0, spec + 1, (rows,), generator=gen)
+        seq_lens = (computed - rejected + q).int()
+        ids = torch.randint(1, 500, (num_tokens,), dtype=torch.int32, generator=gen)
+        ctx = NS(
+            query_start_loc=starts,
+            seq_lens=seq_lens,
+            mamba_state_indices=torch.tensor([7, 2, 5, 0], dtype=torch.int32),
+        )
+        results = []
+        for adapter, runner, flag in ((eager, eager_runner, "0"), (fused, fused_runner, "1")):
+            monkeypatch.setenv("VLLM_TPU_QWEN4_FUSED_PLE_PREP", flag)
+            runner.input_batch.num_computed_tokens_cpu[:] = computed.numpy()
+            runner._attn_metadata_builder_ctx = ctx
+            store = adapter.begin_step()
+            results.append(
+                adapter.prepare_inputs(
+                    ModelInputSnapshot(store, 0, 3, num_tokens, metadata, ids)
+                )
+            )
+        for key in results[0]:
+            assert torch.equal(results[0][key], results[1][key]), (step, key)
+            assert results[0][key].dtype == results[1][key].dtype, (step, key)
+        for a, b in zip(eager._recent, fused._recent):
+            for x, y in zip(a, b):
+                assert torch.equal(x, y), step
