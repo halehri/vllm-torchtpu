@@ -15,6 +15,12 @@
 
 from __future__ import annotations
 
+from .adapter import (
+    PlanReconciliation,
+    floor_for_profile,
+    floor_from_plan,
+    reconcile_plan_vs_standalone,
+)
 from .chips import CHIPS, ChipSpec
 from .collectives import Collective
 from .geometry import ModelGeometry, from_hf_config
@@ -39,13 +45,17 @@ __all__ = [
     "ModelGeometry",
     "ModuleCost",
     "Parallel",
+    "PlanReconciliation",
     "StepFloor",
     "StepShape",
     "ep_busiest_experts",
     "experts_touched",
+    "floor_for_profile",
+    "floor_from_plan",
     "from_hf_config",
     "pass_costs",
     "plan",
+    "reconcile_plan_vs_standalone",
     "spec_cycle_floor",
     "step_floor",
 ]
