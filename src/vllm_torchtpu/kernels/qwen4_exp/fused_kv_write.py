@@ -97,36 +97,60 @@ def fused_layer_write(
     paired = main_slot is not None
     keep = main_keep_mask(main_slot) if paired else 0
 
-    # Routing scalars go to SMEM as-is: pages, offsets, pair coordinates and
-    # verify runs are derived by the scalar core, not by extra XLA ops.
     main_valid = main_valid.astype(jnp.int32)
-    main_page = main_page.astype(jnp.int32)
-    main_offset = main_offset.astype(jnp.int32)
+    page_safe = jnp.where(main_valid != 0, main_page, 0).astype(jnp.int32)
+    offset = (main_offset % page_rows).astype(jnp.int32)
     # Duplicate destinations among valid rows (none in a well-formed step)
-    # keep their order through serial writes. One pairwise fusion.
-    flat = main_page * page_rows + main_offset % page_rows
-    live = main_valid != 0
-    clash = (
-        (flat[:, None] == flat[None, :])
-        & live[:, None]
-        & live[None, :]
-        & ~jnp.eye(tokens, dtype=jnp.bool_)
+    # keep their order through serial writes.
+    flat = jnp.where(
+        main_valid != 0, page_safe * page_rows + offset, -1 - jnp.arange(tokens)
     )
-    unique = jnp.logical_not(jnp.any(clash)).astype(jnp.int32).reshape(1)
+    ordered = jnp.sort(flat)
+    duplicate = jnp.any((ordered[1:] == ordered[:-1]) & (ordered[1:] >= 0))
+    unique = jnp.logical_not(duplicate).astype(jnp.int32).reshape(1)
 
     use_runs = run_starts is not None and run_length > 1 and tokens >= run_length
     if use_runs:
         assert run_lengths is not None
-        run_starts = run_starts.astype(jnp.int32)
-        run_lengths = run_lengths.astype(jnp.int32)
+        span = jnp.arange(run_length, dtype=jnp.int32)
+        first = jnp.clip(run_starts.astype(jnp.int32), 0, tokens - run_length)
+        members = first[:, None] + span[None]
+        run_live = (
+            (run_lengths == run_length)
+            & (run_starts + run_length <= tokens)
+            & jnp.all(main_valid[members] != 0, axis=1)
+            & jnp.all(page_safe[members] == page_safe[first][:, None], axis=1)
+            & jnp.all(offset[members] == offset[first][:, None] + span[None], axis=1)
+            & (unique[0] != 0)
+        )
+        token = jnp.arange(tokens, dtype=jnp.int32)[:, None]
+        covered = jnp.any(
+            run_live[None]
+            & (token >= first[None])
+            & (token < first[None] + run_length),
+            axis=1,
+        )
+        row_valid = jnp.where(covered, 0, main_valid)
+        run_page = page_safe[first]
+        run_offset = offset[first]
     else:
-        run_starts = run_lengths = jnp.zeros((1,), jnp.int32)
-    runs = len(run_starts)
+        first = run_page = run_offset = jnp.zeros((1,), jnp.int32)
+        run_live = jnp.zeros((1,), jnp.bool_)
+        row_valid = main_valid
+    run_live = run_live.astype(jnp.int32)
+    runs = len(first)
 
     comp_tokens = len(comp_pair)
-    comp_pair = comp_pair.astype(jnp.int32)
     comp_write = comp_write.astype(jnp.int32)
-    comp_mask_flat = comp_mask.astype(jnp.int32).reshape(-1)
+    comp_mask = comp_mask.astype(jnp.int32)
+    comp_safe = jnp.where(comp_write != 0, comp_pair, 0).astype(jnp.int32)
+    comp_page = comp_safe // page_rows
+    comp_offset = comp_safe % page_rows
+    comp_full = (comp_mask[:, 0] != 0) & (comp_mask[:, 1] != 0)
+    # 0: skip; 1: write both halves; 2: read, merge one half, write.
+    comp_mode = jnp.where(comp_write != 0, jnp.where(comp_full, 1, 2), 0)
+    comp_mode = comp_mode.astype(jnp.int32)
+    comp_mask_flat = comp_mask.reshape(-1)
     comp_values = jnp.pad(
         comp_values.astype(jnp.bfloat16),
         ((0, 0), (0, 0), (0, width - comp_values.shape[-1])),
@@ -149,15 +173,18 @@ def fused_layer_write(
 
     def kernel(
         page_ref,
-        logical_ref,
+        offset_ref,
         valid_ref,
         unique_ref,
-        pair_ref,
-        cwrite_ref,
+        cpage_ref,
+        coffset_ref,
+        cmode_ref,
         cmask_ref,
         ids_ref,
-        run_start_ref,
-        run_len_ref,
+        run_tok_ref,
+        run_page_ref,
+        run_off_ref,
+        run_live_ref,
         rows_ref,
         cvalues_ref,
         ring_ref,
@@ -167,15 +194,10 @@ def fused_layer_write(
         main_buf,
         comp_buf,
         staged,
-        covered,
-        run_live,
         sems,
     ):
-        def offset(i):
-            return jax.lax.rem(logical_ref[i], page_rows)
-
         def main_copy(i, read):
-            stored = target_ref.at[page_ref[i], pl.ds(offset(i), 1)]
+            stored = target_ref.at[page_ref[i], pl.ds(offset_ref[i], 1)]
             if read:
                 return pltpu.make_async_copy(
                     stored, main_buf.at[pl.ds(i, 1)], sems.at[_MAIN_READ]
@@ -186,24 +208,22 @@ def fused_layer_write(
             )
 
         def run_copy(r, read):
-            first = run_start_ref[r]
-            stored = target_ref.at[page_ref[first], pl.ds(offset(first), run_length)]
+            stored = target_ref.at[run_page_ref[r], pl.ds(run_off_ref[r], run_length)]
             if read:
                 return pltpu.make_async_copy(
                     stored,
-                    main_buf.at[pl.ds(first, run_length)],
+                    main_buf.at[pl.ds(run_tok_ref[r], run_length)],
                     sems.at[_RUN_READ],
                 )
             source = main_buf if paired else rows_ref
             return pltpu.make_async_copy(
-                source.at[pl.ds(first, run_length)],
+                source.at[pl.ds(run_tok_ref[r], run_length)],
                 stored,
                 sems.at[_RUN_WRITE],
             )
 
         def comp_copy(i, read):
-            pair = pair_ref[i]
-            stored = target_ref.at[pair // page_rows, jax.lax.rem(pair, page_rows), 0]
+            stored = target_ref.at[cpage_ref[i], coffset_ref[i], 0]
             staged_pair = comp_buf.at[i]
             source, dest = (stored, staged_pair) if read else (staged_pair, stored)
             return pltpu.make_async_copy(
@@ -227,52 +247,11 @@ def fused_layer_write(
 
             jax.lax.fori_loop(0, n, body, 0)
 
-        def comp_full(i):
-            return (cmask_ref[2 * i] != 0) & (cmask_ref[2 * i + 1] != 0)
-
-        comp_live = lambda i: cwrite_ref[i] != 0  # noqa: E731
-        comp_merge = lambda i: comp_live(i) & ~comp_full(i)  # noqa: E731
+        main_live = lambda i: valid_ref[i] != 0  # noqa: E731
+        comp_merge = lambda i: cmode_ref[i] == 2  # noqa: E731
+        comp_live = lambda i: cmode_ref[i] != 0  # noqa: E731
         ring_live = lambda i: ids_ref[i] > 0  # noqa: E731
-
-        # Phase 0: a request of exactly ``run_length`` valid rows on one page
-        # (consecutive offsets) moves as one DMA; its rows leave the row path.
-        if use_runs:
-
-            def clear(i, carry):
-                covered[i] = jnp.int32(0)
-                return carry
-
-            jax.lax.fori_loop(0, tokens, clear, 0)
-
-            def plan(r, carry):
-                first = jnp.minimum(run_start_ref[r], tokens - run_length)
-                ok = (
-                    (run_len_ref[r] == run_length)
-                    & (run_start_ref[r] + run_length <= tokens)
-                    & (unique_ref[0] != 0)
-                    & (valid_ref[first] != 0)
-                )
-                for k in range(1, run_length):
-                    ok = (
-                        ok
-                        & (valid_ref[first + k] != 0)
-                        & (page_ref[first + k] == page_ref[first])
-                        & (offset(first + k) == offset(first) + k)
-                    )
-                run_live[r] = ok.astype(jnp.int32)
-
-                @pl.when(ok)
-                def _():
-                    for k in range(run_length):
-                        covered[first + k] = jnp.int32(1)
-
-                return carry
-
-            jax.lax.fori_loop(0, runs, plan, 0)
-            main_live = lambda i: (valid_ref[i] != 0) & (covered[i] == 0)  # noqa: E731
-        else:
-            main_live = lambda i: valid_ref[i] != 0  # noqa: E731
-        run_live_at = lambda r: run_live[r] != 0  # noqa: E731
+        run_live_at = lambda r: run_live_ref[r] != 0  # noqa: E731
 
         # Phase 1: every read in flight.
         if paired:
@@ -306,7 +285,7 @@ def fused_layer_write(
         def merge_comp(i):
             take = (
                 jnp.where(half == 0, cmask_ref[2 * i], cmask_ref[2 * i + 1]) != 0
-            ) | comp_full(i)
+            ) | (cmode_ref[i] == 1)
             bf[i] = jnp.where(take, cvalues_ref[i], bf[i])
 
         each(comp_tokens, comp_live, merge_comp)
@@ -345,7 +324,7 @@ def fused_layer_write(
     return pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=10,
+            num_scalar_prefetch=13,
             grid=(1,),
             in_specs=[
                 full(main_rows.shape),
@@ -359,25 +338,26 @@ def fused_layer_write(
                 pltpu.VMEM(main_rows.shape if paired else (8, *payload), pool.dtype),
                 pltpu.VMEM((max(comp_tokens, 1), packing, width), pool.dtype),
                 pltpu.VMEM((count, state_tokens, *payload), pool.dtype),
-                pltpu.SMEM((tokens,), jnp.int32),
-                pltpu.SMEM((runs,), jnp.int32),
                 pltpu.SemaphoreType.DMA((7,)),
             ],
         ),
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
-        input_output_aliases={14: 0},
+        input_output_aliases={17: 0},
         name="qwen4_exp_qsa_fused_kv_write",
     )(
-        main_page,
-        main_offset,
-        main_valid,
+        page_safe,
+        offset,
+        row_valid,
         unique,
-        comp_pair,
-        comp_write,
+        comp_page.astype(jnp.int32),
+        comp_offset.astype(jnp.int32),
+        comp_mode,
         comp_mask_flat,
         ring_ids,
-        run_starts,
-        run_lengths,
+        first,
+        run_page.astype(jnp.int32),
+        run_offset.astype(jnp.int32),
+        run_live,
         main_rows.astype(pool.dtype),
         comp_values,
         ring,
