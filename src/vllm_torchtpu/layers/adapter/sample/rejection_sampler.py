@@ -428,8 +428,7 @@ def _greedy_rejection_sample(
     return selected_tokens[:batch_size]
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def _random_rejection_sample_with_segment(
+def _random_rejection_sample_impl(
     draft_token_ids: torch.Tensor,
     target_logits: torch.Tensor,
     num_draft_tokens: torch.Tensor,
@@ -619,3 +618,10 @@ def _random_rejection_sample_with_segment(
     selected_tokens[batch_range, accepted_count] = bonus_token_at_accepted_count
 
     return selected_tokens[:batch_size]
+
+
+# Uncompiled body above so fused callers (the runner's single-program
+# non-greedy verify) can inline it into their own graph.
+_random_rejection_sample_with_segment = torch.compile(
+    backend="tpu", fullgraph=True, dynamic=False
+)(_random_rejection_sample_impl)
