@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Standalone decode roofline package for vLLM TorchTPU."""
+"""TPU v7x decode roofline model and serving ceiling calculator."""
 
 from __future__ import annotations
 
@@ -40,12 +40,12 @@ __all__ = [
     "CHIPS",
     "ChipSpec",
     "Collective",
-    "ConcurrencyRow",
     "Dtypes",
     "ModelGeometry",
     "ModuleCost",
     "Parallel",
     "PlanReconciliation",
+    "ConcurrencyRow",
     "StepFloor",
     "StepShape",
     "ep_busiest_experts",

@@ -16,16 +16,28 @@
 from __future__ import annotations
 
 import math
-import types
 from dataclasses import dataclass
 from typing import Any
 
 from .chips import CHIPS, ChipSpec
 from .geometry import ModelGeometry
-from .modules import Dtypes, ModuleCost, Parallel, StepShape, experts_touched
+from .modules import (
+    Dtypes,
+    ModuleCost,
+    Parallel,
+    StepShape,
+    _attn_layer_collectives,
+    _embed_collectives,
+    _lm_head_collectives,
+    _moe_layer_collectives,
+    _split_matmul_flops,
+    ep_busiest_experts,
+    experts_touched,
+)
 from .step import StepFloor, _combine_modules, step_floor
 
 DEFAULT_DTYPES = Dtypes()
+DEFAULT_STEP_SHAPE = StepShape()
 
 
 @dataclass(frozen=True)
@@ -41,17 +53,13 @@ class PlanReconciliation:
     delta_flops: float
 
 
-def _block_collectives(spec: Any, n_layers: int, r_val: int) -> int:
-    if r_val > 1 and spec is not None and spec.reduction == "allreduce":
-        return n_layers
-    return 0
-
-
 def _dtype_bytes(dt: Any) -> float:
     """Return element size in bytes from a JAX/NumPy dtype, class, or string."""
     if isinstance(dt, (int, float)):
         return float(dt)
     name = getattr(dt, "__name__", str(dt)).lower()
+    if "nvfp4" in name:
+        return 0.5625
     if "float4" in name or "fp4" in name or "int4" in name:
         return 0.5
     if "float8" in name or "fp8" in name or "int8" in name or "uint8" in name:
@@ -69,53 +77,84 @@ def _dtype_bytes(dt: Any) -> float:
     raise ValueError(f"Unrecognized dtype in Megakernel Plan: {dt!r}")
 
 
+def _resolve_cache_decl(mod: Any, model_spec: Any) -> Any:
+    fn = getattr(mod, "cache_decl", None)
+    if fn is None:
+        return None
+    if not callable(fn):
+        return fn
+    cfg = getattr(model_spec, "config", None) if model_spec is not None else None
+    try:
+        return fn(cfg)
+    except TypeError:
+        return fn()
+
+
+def _derive_parallel(
+    p: Any,
+    ex: Any,
+    geom: ModelGeometry,
+    r_val: int,
+    weight_decls: tuple[Any, ...],
+) -> Parallel:
+    tiles = getattr(ex, "tiles", None) if ex is not None else None
+    rsag = bool(getattr(tiles, "rsag", False)) if tiles is not None else False
+    hier = int(getattr(tiles, "hier", 0)) if tiles is not None else 0
+    if rsag:
+        ar_algo = "two_shot"
+    elif hier == 0:
+        ar_algo = "one_shot"
+    else:
+        raise NotImplementedError(f"hier={hier} wire model")
+
+    mp = getattr(p, "module_params", None) or {}
+    gqa_p = mp.get("gqa") if isinstance(mp, dict) else None
+    is_split = bool(getattr(gqa_p, "SPLIT", False))
+    g_val = max(1, r_val // geom.num_kv_heads) if geom.num_kv_heads > 0 else 1
+    kv_split = g_val if is_split else 1
+    kv_merge = "exchange" if is_split else "ag_rs"
+
+    e13 = next(
+        (w for w in weight_decls if w.name == "e13" and getattr(w, "lead_dims", ())),
+        None,
+    )
+    if (
+        e13 is not None
+        and r_val > 1
+        and geom.num_experts > 0
+        and int(e13.lead_dims[0]) == geom.num_experts // r_val
+    ):
+        moe_mode = "ep"
+    else:
+        moe_mode = "tp_slice"
+
+    return Parallel(
+        tp=r_val,
+        kv_split=kv_split,
+        kv_merge=kv_merge,
+        moe=moe_mode,
+        ar_algo=ar_algo,
+    )
+
+
 def floor_from_plan(
     p: Any,
     ex: Any = None,
     *,
+    geom: ModelGeometry,
+    par: Parallel | None = None,
     B: int | None = None,
     S: int | None = None,
     T: int | None = None,
-    R: int | None = None,
     state_writes: int | None = None,
     chip: ChipSpec = CHIPS["tpu7x"],
-    kv_path: str = "fused",
-    q_heads_global: int | None = None,
-    num_kv_heads_global: int | None = None,
-    num_experts_global: int | None = None,
-    top_k: int = 10,
-    vocab: int = 0,
-    lm_head_weight_bytes: float = 1.0,
+    dt: Dtypes = DEFAULT_DTYPES,
+    collective_latency_s: float = 0.0,
     include_plan_extras: bool = True,
 ) -> StepFloor:
-    """Derive a StepFloor directly from a megakernel.planner.Plan and ExecSpec.
-
-    Args:
-        p: A ``megakernel.planner.Plan`` (or duck-typed equivalent).
-        ex: Optional ``megakernel.exec_spec.ExecSpec`` providing ``B``,
-            ``T``, ``R``, ``ctx``.
-        B: Sequence batch size (if ``ex`` is provided and ``B`` is omitted,
-            ``ex.B // ex.T``).
-        S: Active KV context length per sequence (defaults to ``ex.ctx`` or ``0``).
-        T: Tokens/rows per sequence (defaults to ``ex.T`` or ``1``).
-        R: Tensor/expert parallel rank count (defaults to ``ex.R`` or ``1``).
-        state_writes: Recurrent state write count per sequence (defaults to ``T``).
-        chip: Target ``ChipSpec`` (defaults to ``CHIPS["tpu7x"]``).
-        kv_path: ``"fused"`` (split KV pass within KV group) or ``"standard"``.
-        q_heads_global: Total query attention heads in the model.
-        num_kv_heads_global: Total KV attention heads in the model (for KV group size).
-        num_experts_global: Total routed experts across all ranks.
-        top_k: Active routed experts per token.
-        vocab: Optional vocabulary size to append an ``lm_head`` ``ModuleCost`` row.
-        lm_head_weight_bytes: Element size in bytes for ``lm_head`` weights.
-        include_plan_extras: When ``True`` (default), includes Megakernel-specific
-            ``BA_PAD=128`` columns in ``lin_in``, the ``es`` F32 scale table in ``moe``,
-            and a ``smalls`` ``ModuleCost`` row. When ``False``, strips those three
-            plan-only extras and restores unpadded GDN ``conv`` weights to match
-            standalone ``step_floor`` byte-for-byte.
-    """
+    """Derive a StepFloor directly from a megakernel.planner.Plan and ExecSpec."""
     t_val = int(T if T is not None else getattr(ex, "T", 1))
-    r_val = int(R if R is not None else getattr(ex, "R", 1))
+    r_val = int(par.tp if par is not None else getattr(ex, "R", 1))
     if B is not None:
         b_val = int(B)
     elif ex is not None and hasattr(ex, "B"):
@@ -126,225 +165,187 @@ def floor_from_plan(
     sw_val = int(state_writes if state_writes is not None else t_val)
     m_rows = b_val * t_val
 
-    block_counts: dict[str, int] = dict(getattr(p, "block_layer_counts", {}))
-    raw_specs = getattr(p, "block_specs", None)
-    if raw_specs is not None:
-        block_specs: dict[str, Any] = {bs.name: bs for bs in raw_specs}
-    else:
-        block_specs = {}
-        bp_dict = getattr(p, "block_params", {})
-        sd_dict = getattr(p, "state_decls", {})
-        if "gqa" in bp_dict or "gqa" in block_counts:
-            bp_gqa = bp_dict.get("gqa")
-            kc_state = sd_dict.get("kc")
-            page_dtype = (
-                getattr(kc_state, "dtype", "bfloat16") if kc_state else "bfloat16"
-            )
-            block_specs["gqa"] = types.SimpleNamespace(
-                name="gqa",
-                reduction="allreduce",
-                cache_decl=types.SimpleNamespace(
-                    hd=getattr(bp_gqa, "HD", 256) if bp_gqa else 256,
-                    kvh=getattr(bp_gqa, "NKV", 1) if bp_gqa else 1,
-                    page_size=getattr(bp_gqa, "BLK", 128) if bp_gqa else 128,
-                    page_dtype=page_dtype,
-                ),
-            )
-        if "gdn" in bp_dict or "gdn" in block_counts:
-            bp_gdn = bp_dict.get("gdn")
-            rec_state = sd_dict.get("rec")
-            rec_dtype = (
-                getattr(rec_state, "dtype", "bfloat16") if rec_state else "bfloat16"
-            )
-            conv_state = sd_dict.get("conv")
-            conv_dtype = (
-                getattr(conv_state, "dtype", "float32") if conv_state else "float32"
-            )
-            block_specs["gdn"] = types.SimpleNamespace(
-                name="gdn",
-                reduction="allreduce",
-                cache_decl=types.SimpleNamespace(
-                    kh=getattr(bp_gdn, "kh", 2) if bp_gdn else 2,
-                    vh=getattr(bp_gdn, "vh", 8) if bp_gdn else 8,
-                    KD=getattr(bp_gdn, "KD", 128) if bp_gdn else 128,
-                    VD=getattr(bp_gdn, "VD", 128) if bp_gdn else 128,
-                    rec_dtype=rec_dtype,
-                    conv_taps=3,
-                    conv_dtype=conv_dtype,
-                ),
-            )
-        if "moe" in bp_dict or "moe" in block_counts:
-            block_specs["moe"] = types.SimpleNamespace(
-                name="moe",
-                reduction="allreduce",
-                cache_decl=None,
-            )
-
     raw_weights = getattr(p, "weight_decls", ())
     if isinstance(raw_weights, dict):
         weight_decls = tuple(raw_weights.values())
     else:
         weight_decls = tuple(raw_weights)
 
-    # Infer hidden dimension from static projection K (e.g. att_in, lin_in, router)
-    hidden = 0
+    eff_par = (
+        par if par is not None else _derive_parallel(p, ex, geom, r_val, weight_decls)
+    )
+
+    module_counts: dict[str, int] = dict(getattr(p, "module_layer_counts", {}))
+    model_spec = getattr(p, "model_spec", None)
+    all_mods_fn = getattr(model_spec, "all_modules", None)
+    raw_mods = all_mods_fn() if callable(all_mods_fn) else ()
+    mod_map: dict[str, Any] = {m.name: m for m in raw_mods}
+
+    hidden = geom.hidden
     for wd in weight_decls:
         if wd.name in ("att_in", "lin_in", "router"):
             hidden = int(wd.K)
             break
-    ar_payload = float(m_rows * hidden * 2)
 
-    # Group weight declarations by owner block
     weight_owners: dict[str, str] = dict(getattr(p, "weight_owners", {}))
     by_owner: dict[str, list[Any]] = {}
     for wd in weight_decls:
         owner = getattr(wd, "owner", None) or weight_owners.get(wd.name, "unknown")
         by_owner.setdefault(owner, []).append(wd)
 
-    modules: list[ModuleCost] = []
+    modules: list[ModuleCost] = [
+        ModuleCost(
+            name="embed",
+            hbm_bytes=0.0,
+            fp8_flops=0.0,
+            bf16_flops=0.0,
+            collectives=_embed_collectives(m_rows, hidden, eff_par),
+        )
+    ]
 
-    # 1. GQA block
-    n_gqa = block_counts.get("gqa", 0)
+    q_per_rank = max(1, geom.num_heads // r_val)
+
+    # 1. GQA module
+    n_gqa = module_counts.get("gqa", 0)
     if n_gqa > 0:
+        gqa_mod = mod_map.get("gqa")
+        cd = _resolve_cache_decl(gqa_mod, model_spec) if gqa_mod is not None else None
+        if cd is None or getattr(cd, "page_dtype", None) is None:
+            raise ValueError(
+                "Module 'gqa' requires a cache_decl() with non-None page_dtype"
+            )
         gqa_hbm = 0.0
         gqa_fp8 = 0.0
         gqa_bf16 = 0.0
         for wd in by_owner.get("gqa", ()):
             db = _dtype_bytes(wd.dtype)
-            elems = float(wd.K) * float(wd.N)
-            gqa_hbm += n_gqa * elems * db
-            flops = n_gqa * 2.0 * m_rows * elems
-            if db <= 1.0:
-                gqa_fp8 += flops
-            else:
-                gqa_bf16 += flops
+            elems = float(n_gqa) * float(wd.K) * float(wd.N)
+            gqa_hbm += elems * db
+            fp8_f, bf16_f = _split_matmul_flops(m_rows, elems, db, dt.act)
+            gqa_fp8 += fp8_f
+            gqa_bf16 += bf16_f
 
-        gqa_spec = block_specs.get("gqa")
-        cd = getattr(gqa_spec, "cache_decl", None)
-        if cd is not None:
-            kvh = int(cd.kvh)
-            hd = int(cd.hd)
-            kv_b = _dtype_bytes(cd.page_dtype)
-            att_out_decl = next(
-                (w for w in by_owner.get("gqa", ()) if w.name == "att_out"), None
-            )
-            if q_heads_global is not None:
-                q_per_rank = max(1, q_heads_global // r_val)
-            elif att_out_decl is not None and hd > 0:
-                q_per_rank = max(1, int(att_out_decl.K) // hd)
-            else:
-                q_per_rank = max(1, 32 // r_val)
-            kv_heads_glob = (
-                num_kv_heads_global if num_kv_heads_global is not None else 2
-            )
-            kv_group = (
-                max(1, r_val // kv_heads_glob) if kv_heads_glob > 0 else 1
-            )
-            kv_div = kv_group if kv_path == "fused" else 1
-            kv_bytes = float(b_val * kvh * hd * 2 * s_val) * kv_b / kv_div
-            gqa_hbm += n_gqa * kv_bytes
-            gqa_bf16 += n_gqa * (4.0 * m_rows * q_per_rank * s_val * hd)
+        kvh = int(cd.kvh)
+        hd = int(cd.hd)
+        kv_b = _dtype_bytes(cd.page_dtype)
+        kv_bytes = float(b_val * kvh * hd * 2 * s_val * n_gqa) * kv_b / eff_par.kv_split
+        gqa_hbm += kv_bytes
+        gqa_bf16 += float(n_gqa) * (4.0 * m_rows * q_per_rank * s_val * hd)
 
-        n_coll_gqa = _block_collectives(gqa_spec, n_gqa, r_val)
-        ici_gqa = ar_payload * n_coll_gqa if n_coll_gqa > 0 else 0.0
+        gqa_colls = (
+            _attn_layer_collectives(
+                b_val,
+                t_val,
+                hidden,
+                q_per_rank,
+                hd,
+                eff_par,
+                is_full_attention=True,
+            )
+            * n_gqa
+            if getattr(gqa_mod, "reduction", "allreduce") == "allreduce"
+            else ()
+        )
         modules.append(
             ModuleCost(
                 name="gqa",
                 hbm_bytes=gqa_hbm,
                 fp8_flops=gqa_fp8,
                 bf16_flops=gqa_bf16,
-                ici_bytes=ici_gqa,
-                n_collectives=n_coll_gqa,
+                collectives=gqa_colls,
             )
         )
 
-    # 2. GDN block
-    n_gdn = block_counts.get("gdn", 0)
+    # 2. GDN module
+    n_gdn = module_counts.get("gdn", 0)
     if n_gdn > 0:
+        gdn_mod = mod_map.get("gdn")
+        cd = _resolve_cache_decl(gdn_mod, model_spec) if gdn_mod is not None else None
+        if (
+            cd is None
+            or getattr(cd, "rec_dtype", None) is None
+            or getattr(cd, "conv_dtype", None) is None
+        ):
+            raise ValueError(
+                "Module 'gdn' requires a cache_decl() with "
+                "non-None rec_dtype and conv_dtype"
+            )
         gdn_hbm = 0.0
         gdn_fp8 = 0.0
         gdn_bf16 = 0.0
-        gdn_spec = block_specs.get("gdn")
-        cd = getattr(gdn_spec, "cache_decl", None)
+        kh = int(cd.kh)
+        vh = int(cd.vh)
+        if r_val > 1 and vh == geom.linear_v_heads:
+            vh = max(1, vh // r_val)
+            kh = max(1, kh // r_val)
+        kd = int(cd.KD)
+        vd = int(cd.VD)
         for wd in by_owner.get("gdn", ()):
             db = _dtype_bytes(wd.dtype)
             n_cols = float(wd.N)
-            if not include_plan_extras and wd.name == "lin_in" and cd is not None:
-                vh = int(cd.vh)
+            if not include_plan_extras and wd.name == "lin_in":
                 ba_pad = max(2 * vh, 128)
-                n_cols -= float(ba_pad - 2 * vh)
-            elems = float(wd.K) * n_cols
-            gdn_hbm += n_gdn * elems * db
-            flops = n_gdn * 2.0 * m_rows * elems
-            if db <= 1.0:
-                gdn_fp8 += flops
-            else:
-                gdn_bf16 += flops
+                n_cols -= float(ba_pad)
+            elems = float(n_gdn) * float(wd.K) * n_cols
+            gdn_hbm += elems * db
+            fp8_f, bf16_f = _split_matmul_flops(m_rows, elems, db, dt.act)
+            gdn_fp8 += fp8_f
+            gdn_bf16 += bf16_f
 
-        if cd is not None:
-            kh = int(cd.kh)
-            vh = int(cd.vh)
-            kd = int(cd.KD)
-            vd = int(cd.VD)
-            state_b = _dtype_bytes(cd.rec_dtype)
-            conv_b = _dtype_bytes(getattr(cd, "conv_dtype", cd.rec_dtype))
-            conv_taps = int(cd.conv_taps)
-            conv_k = conv_taps + 1
-            qkv_r = 2 * kh * kd + vh * vd
-            if not include_plan_extras:
-                # Restore conv weight + FLOPs to gdn to match standalone step_floor
-                lin_in_decl = next(
-                    (w for w in by_owner.get("gdn", ()) if w.name == "lin_in"),
-                    None,
-                )
-                w_b = (
-                    _dtype_bytes(lin_in_decl.dtype) if lin_in_decl is not None else 1.0
-                )
-                conv_elems = float(conv_k * qkv_r)
-                gdn_hbm += n_gdn * conv_elems * w_b
-                if w_b <= 1.0:
-                    gdn_fp8 += n_gdn * 2.0 * m_rows * conv_elems
-                else:
-                    gdn_bf16 += n_gdn * 2.0 * m_rows * conv_elems
-            state_elems = float(vh * kd * vd)
-            conv_state_elems = float(qkv_r * conv_taps)
-            gdn_hbm += (
-                n_gdn
-                * float(b_val)
-                * (1.0 + sw_val)
-                * (state_elems * state_b + conv_state_elems * conv_b)
+        state_b = _dtype_bytes(cd.rec_dtype)
+        conv_b = _dtype_bytes(cd.conv_dtype)
+        conv_taps = int(cd.conv_taps)
+        conv_k = conv_taps + 1
+        qkv_r = 2 * kh * kd + vh * vd
+        if not include_plan_extras:
+            aux_elems = float(n_gdn * (hidden * 2 * vh + conv_k * qkv_r))
+            gdn_hbm += aux_elems * dt.w_aux
+            aux_fp8, aux_bf16 = _split_matmul_flops(m_rows, aux_elems, dt.w_aux, dt.act)
+            gdn_fp8 += aux_fp8
+            gdn_bf16 += aux_bf16
+        state_elems = float(vh * kd * vd)
+        conv_state_elems = float(qkv_r * conv_taps)
+        gdn_hbm += (
+            n_gdn
+            * float(b_val)
+            * (1.0 + sw_val)
+            * (state_elems * state_b + conv_state_elems * conv_b)
+        )
+
+        gdn_colls = (
+            _attn_layer_collectives(
+                b_val,
+                t_val,
+                hidden,
+                q_per_rank,
+                geom.head_dim,
+                eff_par,
+                is_full_attention=False,
             )
-
-        n_coll_gdn = _block_collectives(gdn_spec, n_gdn, r_val)
-        ici_gdn = ar_payload * n_coll_gdn if n_coll_gdn > 0 else 0.0
+            * n_gdn
+            if getattr(gdn_mod, "reduction", "allreduce") == "allreduce"
+            else ()
+        )
         modules.append(
             ModuleCost(
                 name="gdn",
                 hbm_bytes=gdn_hbm,
                 fp8_flops=gdn_fp8,
                 bf16_flops=gdn_bf16,
-                ici_bytes=ici_gdn,
-                n_collectives=n_coll_gdn,
+                collectives=gdn_colls,
             )
         )
 
-    # 3. MoE block
-    n_moe = block_counts.get("moe", 0)
+    # 3. MoE module
+    n_moe = module_counts.get("moe", 0)
     if n_moe > 0:
+        moe_mod = mod_map.get("moe")
         moe_hbm = 0.0
+        moe_hbm_min = 0.0
         moe_fp8 = 0.0
         moe_bf16 = 0.0
-        moe_wds = by_owner.get("moe", ())
-        router_decl = next((w for w in moe_wds if w.name == "router"), None)
-        lead_decl = next((w for w in moe_wds if w.lead_dims), None)
-        if num_experts_global is not None:
-            e_global = num_experts_global
-        elif router_decl is not None:
-            e_global = int(router_decl.N)
-        elif lead_decl is not None:
-            e_global = int(lead_decl.lead_dims[0])
-        else:
-            e_global = 512
+        e_global = geom.num_experts
+        top_k = geom.top_k
         e_d_global = experts_touched(e_global, top_k, m_rows)
         for wd in by_owner.get("moe", ()):
             if wd.name == "es" and not include_plan_extras:
@@ -353,37 +354,56 @@ def floor_from_plan(
             elems = float(wd.K) * float(wd.N)
             lead = getattr(wd, "lead_dims", ())
             if not lead:
-                # Static replicated/TP-sharded weight (router, sh13, sh2)
-                moe_hbm += n_moe * elems * db
-                flops = n_moe * 2.0 * m_rows * elems
-                if db <= 1.0:
-                    moe_fp8 += flops
-                else:
-                    moe_bf16 += flops
+                w_bytes = float(n_moe) * elems * db
+                moe_hbm += w_bytes
+                moe_hbm_min += w_bytes
+                rows_eff = (
+                    math.ceil(m_rows / r_val)
+                    if eff_par.residual == "sp" and wd.name in ("sh13", "sh2")
+                    else m_rows
+                )
+                fp8_f, bf16_f = _split_matmul_flops(
+                    rows_eff, float(n_moe) * elems, db, dt.act
+                )
+                moe_fp8 += fp8_f
+                moe_bf16 += bf16_f
             else:
                 e_rank = int(lead[0])
                 scale = float(e_rank) / float(max(1, e_global))
-                e_d_rank = e_d_global * scale
-                moe_hbm += n_moe * e_d_rank * elems * db
+                if e_rank == e_global:
+                    e_d_rank = e_d_global
+                    e_min_rank = float(min(e_global, top_k)) if m_rows > 0 else 0.0
+                elif r_val > 1 and e_rank == e_global // r_val:
+                    e_d_rank = ep_busiest_experts(e_global, top_k, m_rows, r_val)
+                    e_min_rank = float(math.ceil(top_k / r_val)) if m_rows > 0 else 0.0
+                else:
+                    # EPLB slot count: load balancing targets the mean active experts.
+                    e_d_rank = e_d_global * scale
+                    e_min_rank = (
+                        float(min(e_global, top_k)) * scale if m_rows > 0 else 0.0
+                    )
+                moe_hbm += float(n_moe) * e_d_rank * elems * db
+                moe_hbm_min += float(n_moe) * e_min_rank * elems * db
                 if wd.name in ("e13", "e2"):
-                    active_rows = float(m_rows * top_k) * scale
-                    flops = n_moe * 2.0 * active_rows * elems
-                    if db <= 1.0:
-                        moe_fp8 += flops
-                    else:
-                        moe_bf16 += flops
+                    act_elems = float(n_moe * top_k) * scale * elems
+                    fp8_f, bf16_f = _split_matmul_flops(m_rows, act_elems, db, dt.act)
+                    moe_fp8 += fp8_f
+                    moe_bf16 += bf16_f
 
-        moe_spec = block_specs.get("moe")
-        n_coll_moe = _block_collectives(moe_spec, n_moe, r_val)
-        ici_moe = ar_payload * n_coll_moe if n_coll_moe > 0 else 0.0
+        moe_colls = (
+            _moe_layer_collectives(m_rows, hidden, e_global, top_k, eff_par) * n_moe
+            if moe_mod is None
+            or getattr(moe_mod, "reduction", "allreduce") == "allreduce"
+            else ()
+        )
         modules.append(
             ModuleCost(
                 name="moe",
                 hbm_bytes=moe_hbm,
                 fp8_flops=moe_fp8,
                 bf16_flops=moe_bf16,
-                ici_bytes=ici_moe,
-                n_collectives=n_coll_moe,
+                collectives=moe_colls,
+                hbm_bytes_min=moe_hbm_min,
             )
         )
 
@@ -401,13 +421,13 @@ def floor_from_plan(
                         hbm_bytes=smalls_b,
                         fp8_flops=0.0,
                         bf16_flops=0.0,
-                        ici_bytes=0.0,
-                        n_collectives=0,
                     )
                 )
         elif hasattr(p, "smalls_width") and p.smalls_width:
             num_layers = (
-                sum(block_counts.values()) or len(getattr(p, "slot_ar_index", ())) or 60
+                sum(module_counts.values())
+                or len(getattr(p, "slot_ar_index", ()))
+                or geom.num_layers
             )
             smalls_b = float(num_layers * p.smalls_width * 4)
             if smalls_b > 0:
@@ -417,45 +437,42 @@ def floor_from_plan(
                         hbm_bytes=smalls_b,
                         fp8_flops=0.0,
                         bf16_flops=0.0,
-                        ici_bytes=0.0,
-                        n_collectives=0,
                     )
                 )
 
-    # 5. Optional LM head
-    if vocab > 0 and hidden > 0:
-        lm_elems = float(vocab * hidden // r_val)
-        lm_flops = 2.0 * m_rows * lm_elems
+    # 5. LM head from ModelGeometry.vocab and Dtypes.lm_head
+    if geom.vocab > 0 and hidden > 0:
+        lm_elems = float(geom.vocab * hidden // r_val)
+        lm_fp8, lm_bf16 = _split_matmul_flops(m_rows, lm_elems, dt.lm_head, dt.act)
         modules.append(
             ModuleCost(
                 name="lm_head",
-                hbm_bytes=lm_elems * lm_head_weight_bytes,
-                fp8_flops=lm_flops if lm_head_weight_bytes <= 1.0 else 0.0,
-                bf16_flops=0.0 if lm_head_weight_bytes <= 1.0 else lm_flops,
-                ici_bytes=0.0,
-                n_collectives=0,
+                hbm_bytes=lm_elems * dt.lm_head,
+                fp8_flops=lm_fp8,
+                bf16_flops=lm_bf16,
+                collectives=_lm_head_collectives(m_rows, hidden, geom.vocab, eff_par),
             )
         )
 
-    return _combine_modules(tuple(modules), chip)
+    return _combine_modules(
+        tuple(modules), chip, collective_latency_s=collective_latency_s
+    )
 
 
 def floor_for_profile(
     model_spec: Any,
     profile: Any,
     *,
+    geom: ModelGeometry,
+    par: Parallel | None = None,
     B: int,
     S: int,
     T: int = 1,
     R: int | None = None,
     state_writes: int | None = None,
     chip: ChipSpec = CHIPS["tpu7x"],
-    kv_path: str = "fused",
-    q_heads_global: int | None = None,
-    num_kv_heads_global: int | None = None,
-    num_experts_global: int | None = None,
-    top_k: int = 10,
-    vocab: int = 0,
+    dt: Dtypes = DEFAULT_DTYPES,
+    collective_latency_s: float = 0.0,
     include_plan_extras: bool = True,
 ) -> StepFloor:
     """Build ExecSpec + Plan from Megakernel ModelSpec and Profile, then StepFloor."""
@@ -466,9 +483,11 @@ def floor_for_profile(
     planner_mod = importlib.import_module("vllm_torchtpu.megakernel.planner")
     mk_plan = planner_mod.plan
 
-    r_val = int(R if R is not None else getattr(profile, "R", 8) or 8)
-    # GQABlock.plan_params requires ex.ctx % kv_blk == 0 (default kv_blk=2048).
-    # Align the planning ctx to a multiple of 2048, then price the exact runtime S.
+    r_val = int(
+        par.tp
+        if par is not None
+        else (R if R is not None else getattr(profile, "R", 8) or 8)
+    )
     plan_ctx = max(2048, ((max(1, int(S)) + 2047) // 2048) * 2048)
     base = ExecSpec(R=r_val, ctx=plan_ctx)
     ex = profile.exec_for(base, B=int(B) * int(T), T=int(T))
@@ -476,18 +495,15 @@ def floor_for_profile(
     return floor_from_plan(
         p,
         ex,
+        geom=geom,
+        par=par,
         B=B,
         S=S,
         T=T,
-        R=r_val,
         state_writes=state_writes,
         chip=chip,
-        kv_path=kv_path,
-        q_heads_global=q_heads_global,
-        num_kv_heads_global=num_kv_heads_global,
-        num_experts_global=num_experts_global,
-        top_k=top_k,
-        vocab=vocab,
+        dt=dt,
+        collective_latency_s=collective_latency_s,
         include_plan_extras=include_plan_extras,
     )
 
@@ -496,33 +512,39 @@ def reconcile_plan_vs_standalone(
     p: Any,
     ex: Any,
     geom: ModelGeometry,
-    par: Parallel,
-    shape: StepShape,
+    par: Parallel | None = None,
+    shape: StepShape = DEFAULT_STEP_SHAPE,
     dt: Dtypes = DEFAULT_DTYPES,
     chip: ChipSpec = CHIPS["tpu7x"],
     include_plan_extras: bool = False,
 ) -> tuple[PlanReconciliation, ...]:
     """Compare floor_from_plan against standalone step_floor module-by-module."""
+    raw_weights = getattr(p, "weight_decls", ())
+    weight_decls = (
+        tuple(raw_weights.values())
+        if isinstance(raw_weights, dict)
+        else tuple(raw_weights)
+    )
+    r_val = int(par.tp if par is not None else getattr(ex, "R", 1))
+    eff_par = (
+        par if par is not None else _derive_parallel(p, ex, geom, r_val, weight_decls)
+    )
     plan_sf = floor_from_plan(
         p,
         ex,
+        geom=geom,
+        par=eff_par,
         B=shape.batch,
         S=shape.context,
         T=shape.rows_per_seq,
-        R=par.tp,
         state_writes=shape.state_writes,
         chip=chip,
-        kv_path=par.kv_path,
-        q_heads_global=geom.num_heads,
-        num_kv_heads_global=geom.num_kv_heads,
-        num_experts_global=geom.num_experts,
-        top_k=geom.top_k,
-        vocab=0,
+        dt=dt,
         include_plan_extras=include_plan_extras,
     )
-    std_sf = step_floor(geom, chip, par, shape, dt)
-    plan_map = {m.name: m for m in plan_sf.modules}
-    std_map = {m.name: m for m in std_sf.modules if m.name != "lm_head"}
+    std_sf = step_floor(geom, chip, eff_par, shape, dt)
+    plan_map = {m.name: m for m in plan_sf.modules if m.name != "embed"}
+    std_map = {m.name: m for m in std_sf.modules if m.name != "embed"}
     names = list(dict.fromkeys([*std_map.keys(), *plan_map.keys()]))
     rows: list[PlanReconciliation] = []
     for name in names:
