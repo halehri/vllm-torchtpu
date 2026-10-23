@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
+    VLLM_TPU_QSA_FUSED_KV_WRITE: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -468,6 +469,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel's static envelope (non-TPU7x, unsupported shapes) still use RPA.
     "VLLM_TPU_QSA_FUSED_SPARSE_DECODE": env_bool(
         "VLLM_TPU_QSA_FUSED_SPARSE_DECODE", default=False
+    ),
+    # Qwen4-exp pooled QSA decode/verify steps: write main KV, compressed
+    # indexer keys and the raw ring/tags of a layer with one Pallas kernel
+    # whose row DMAs are all in flight together, and read the ring with every
+    # request's DMA outstanding. Prefill-sized steps keep the tiled writers.
+    "VLLM_TPU_QSA_FUSED_KV_WRITE": env_bool(
+        "VLLM_TPU_QSA_FUSED_KV_WRITE", default=False
     ),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
