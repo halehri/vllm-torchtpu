@@ -32,6 +32,17 @@ class GatedResidual(common_hc.GatedResidual):
             raise ValueError("HC prefill norm tile must be a multiple of 64")
         if prefill_full_tile and (prefill_full_tile < 128 or prefill_full_tile % 128):
             raise ValueError("HC prefill full mix tile must be a multiple of 128")
+        # Decode-size normalization scales by the F32 (1 + weight). Computing it
+        # once after loading (``finalize_weights``) keeps the same F32 values
+        # without a per-step convert/add on every HC norm.
+        self._norm_scale_ready = False
+        if self.config.hc_per_branch_norm:
+            weight = self.hc_norm.weight
+            self.register_buffer(
+                "hc_norm_scale",
+                torch.empty(weight.shape, dtype=torch.float32, device=weight.device),
+                persistent=False,
+            )
         self.prefill_up_tile = prefill_up_tile
         self.prefill_norm_tile = prefill_norm_tile
         self.prefill_full_tile = prefill_full_tile
@@ -109,7 +120,25 @@ class GatedResidual(common_hc.GatedResidual):
                 values * torch.rsqrt(variance + self.hc_norm.variance_epsilon)
             )
         output = torch.cat(normalized, dim=-1)
-        return (output * (1.0 + self.hc_norm.weight.float())).to(hyper_input.dtype)
+        scale = (
+            self.hc_norm_scale
+            if self._norm_scale_ready
+            else 1.0 + self.hc_norm.weight.float()
+        )
+        return (output * scale).to(hyper_input.dtype)
+
+    @torch.no_grad()
+    def finalize_weights(self):
+        """Refresh derived weights; call after (re)loading ``hc_norm``."""
+        if self.config.hc_per_branch_norm:
+            self.hc_norm_scale.copy_(1.0 + self.hc_norm.weight.float())
+            self._norm_scale_ready = True
+
+
+def finalize_hyper_connections(module: torch.nn.Module):
+    for child in module.modules():
+        if isinstance(child, GatedResidual):
+            child.finalize_weights()
 
     def mix(self, hyper_input):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
