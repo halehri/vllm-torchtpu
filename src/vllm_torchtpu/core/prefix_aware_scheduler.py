@@ -28,6 +28,7 @@ Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
 """
 
+import time
 from itertools import islice
 from typing import cast
 
@@ -47,6 +48,7 @@ logger = init_logger("vllm." + __name__)
 _LOG_EVERY = 1000
 
 # Priority tiers: lower values admit earlier.
+_TIER_OVERDUE = 0
 _TIER_PREEMPTED = 1
 _TIER_NORMAL = 2
 
@@ -65,6 +67,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_scoring_broken = False
         self._interleave_step = 0
         self._decode_interleave = max(1, envs.VLLM_TPU_DECODE_INTERLEAVE)
+        self._max_wait_s = envs.VLLM_TPU_PAW_MAX_WAIT_S
 
         logger.info(
             "PrefixAwareScheduler ACTIVE (window=%d, decode interleave=%d)",
@@ -99,6 +102,12 @@ class PrefixAwareScheduler(AsyncScheduler):
         warmth = self._prefix_warmth(request)
         cold_tokens = float(request.num_tokens - warmth)
         tier = _TIER_PREEMPTED if request.num_preemptions > 0 else _TIER_NORMAL
+        max_wait = getattr(self, "_max_wait_s", 0.0)
+        if max_wait > 0 and time.time() - request.arrival_time > max_wait:
+            # Anti-starvation: warmest-first keeps passing over cold, long
+            # prompts while warm follow-ups keep arriving. Past the wait cap
+            # a request outranks every warm one, oldest first.
+            return (_TIER_OVERDUE, 0.0, request.arrival_time), warmth
         return (tier, cold_tokens, request.arrival_time), warmth
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:

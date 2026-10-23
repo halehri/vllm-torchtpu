@@ -241,3 +241,18 @@ def test_decode_interleave_off_by_default():
         for _ in range(3):
             s.schedule()
     assert seen == [False, False, False]
+
+
+def test_overdue_request_outranks_warm_ones():
+    now = time.time()
+    r_old_cold = _make_request("old_cold", num_tokens=50000, arrival_time=now - 30)
+    r_warm = _make_request("warm", num_tokens=50000, arrival_time=now - 1)
+    s = _make_scheduler([r_old_cold, r_warm], {"warm": 49000})
+    s._max_wait_s = 10.0
+    s.waiting.remove(r_old_cold)
+    s.waiting.add_request(r_old_cold)  # queue: warm, old_cold
+    s._promote_warmest(s.waiting)
+    assert next(iter(s.waiting)) is r_old_cold
+    s._max_wait_s = 0.0  # off: warmest first again
+    s._promote_warmest(s.waiting)
+    assert next(iter(s.waiting)) is r_warm

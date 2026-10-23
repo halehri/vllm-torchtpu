@@ -193,6 +193,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     VLLM_TPU_DECODE_INTERLEAVE: int = 1
+    VLLM_TPU_PAW_MAX_WAIT_S: float = 0.0
     VLLM_TPU_FUSED_ASYNC_DRAFT_SEED: bool = True
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
     VLLM_TPU_MTP_DRAFT_ROWS: bool = False
@@ -1213,6 +1214,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # PrefixAwareScheduler: of every N steps, N - 1 defer prefill work while a
     # decode is running (decode-priority interleave). 1 = off.
     "VLLM_TPU_DECODE_INTERLEAVE": env_int("VLLM_TPU_DECODE_INTERLEAVE", 1),
+    # PrefixAwareScheduler: a request waiting longer than this many seconds
+    # outranks warm ones (oldest first). 0 = off (pure warmest-first).
+    "VLLM_TPU_PAW_MAX_WAIT_S": lambda: float(
+        os.getenv("VLLM_TPU_PAW_MAX_WAIT_S", "0") or 0
+    ),
     # Async spec decode: derive the draft seed (token, position, rejected
     # count) from the rejection-sampler output in one compiled program per
     # request-padding bucket instead of ~15 eager ones (eagle3.py
