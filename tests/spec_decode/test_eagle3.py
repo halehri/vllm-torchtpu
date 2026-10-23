@@ -978,8 +978,12 @@ def _draft_rows_proposer(monkeypatch, enabled=True, **runner):
     proposer.runner = SimpleNamespace(
         _pcp_enabled=runner.get("pcp", False),
         _dp_lockstep_enabled=lambda: runner.get("lockstep", False),
+        most_model_len=runner.get("most_model_len"),
+        num_reqs_max_model_len=16,
+        num_reqs_most_model_len=32 if runner.get("most_model_len") else None,
     )
     proposer._share_mtp_indices = runner.get("share", False)
+    proposer._draft_has_moe_cache = runner.get("moe", False)
     return proposer
 
 
@@ -991,7 +995,11 @@ def _draft_rows_proposer(monkeypatch, enabled=True, **runner):
         (True, False, {}, False),
         (True, True, {"share": True}, False),
         (True, True, {"pcp": True}, False),
-        (True, True, {"lockstep": True}, False),
+        # EP-DP lockstep: padding chunks replay step 0 at the same rows, as
+        # long as every chunk shares the padding chunks' capacity.
+        (True, True, {"lockstep": True}, True),
+        (True, True, {"lockstep": True, "moe": True}, True),
+        (True, True, {"lockstep": True, "moe": True, "most_model_len": 4096}, False),
     ],
 )
 def test_resolve_draft_rows(monkeypatch, enabled, supported, runner, expected):
@@ -1129,10 +1137,16 @@ def test_propose_empty_batch():
     )
 
 
-def _lockstep_draft_trace(monkeypatch, method, K, num_chunks, num_real):
+def _lockstep_draft_trace(
+    monkeypatch, method, K, num_chunks, num_real, fused=False, draft_rows=False
+):
     """The draft programs one EP-DP lockstep rank emits in a step whose
     coordinated chunk bound is `num_chunks`: propose() with `num_real` real
-    chunks, or the idle-rank replay when it has none."""
+    chunks, or the idle-rank replay when it has none.
+
+    `fused` runs loop steps 1..K-1 as the fused program, with padding-chunk
+    metadata from a model adapter; `draft_rows` runs draft step 0 at fixed
+    per-request rows."""
     import vllm_torchtpu.spec_decode.eagle3 as e3
 
     monkeypatch.setattr(e3, "synchronize_tensors", lambda *a, **k: None)
@@ -1164,10 +1178,32 @@ def _lockstep_draft_trace(monkeypatch, method, K, num_chunks, num_real):
         trace.append(("combine", [tuple(a.shape) for a in aux]))
         return aux[0]
 
-    def forward(*, step_idx, num_tokens_padded, **_):
-        trace.append(("forward", step_idx, num_tokens_padded))
-        hidden = torch.zeros((num_tokens_padded, 8))
+    def forward(*, step_idx, num_tokens_padded, draft_rows=None, **_):
+        rows = None if draft_rows is None else tuple(draft_rows.shape)
+        trace.append(("forward", step_idx, num_tokens_padded, rows))
+        hidden = torch.zeros((num_tokens_padded if rows is None else rows[0], 8))
         return hidden, hidden
+
+    if fused:
+        proposer._mtp_fused_loop = object()
+        proposer._draft_attn_layer_names = {"draft.attn"}
+        proposer.runner.model_adapter = SimpleNamespace(
+            draft_idle_metadata=lambda names, n, b: {
+                name: SimpleNamespace(seq_lens=torch.zeros(n, dtype=torch.int32))
+                for name in names
+            }
+        )
+
+        def fused_loop(*, chunk, input_ids, positions, hidden_states, **_):
+            trace.append(("fused", tuple(input_ids.shape), tuple(hidden_states.shape)))
+            return tuple(
+                torch.zeros(input_ids.shape[0], dtype=torch.int32) for _ in range(K - 1)
+            )
+
+        proposer._run_mtp_fused_loop = fused_loop
+    if draft_rows:
+        proposer._draft_rows = True
+        proposer._draft_gather_positions = lambda pos, idx: pos[idx]
 
     def propose_token(hidden):
         trace.append(("lm_head", tuple(hidden.shape)))
@@ -1230,6 +1266,57 @@ def test_dp_lockstep_draft_trace_independent_of_real_chunk_count(
     for num_real in range(num_chunks):
         padded = _lockstep_draft_trace(monkeypatch, method, K, num_chunks, num_real)
         assert padded == full, f"{num_real} of {num_chunks} chunks real"
+
+
+@pytest.mark.parametrize("K", [2, 3])
+@pytest.mark.parametrize("num_chunks", [1, 2, 3])
+@pytest.mark.parametrize(
+    "fused,draft_rows", [(True, False), (False, True), (True, True)]
+)
+def test_dp_lockstep_fused_loop_and_draft_rows_trace_matches(
+    monkeypatch, K, num_chunks, fused, draft_rows
+):
+    """The fused draft loop and draft rows under EP-DP lockstep: padding
+    chunks (and an idle rank) run step 0 at the same fixed rows and one fused
+    program per chunk after the real ones, so every rank emits the same
+    sequence whatever its real chunk count."""
+    full = _lockstep_draft_trace(
+        monkeypatch, "mtp", K, num_chunks, num_chunks, fused, draft_rows
+    )
+    forwards = [t for t in full if t[0] == "forward"]
+    if draft_rows:
+        assert all(t[3] == (16,) for t in forwards if t[1] == 0)
+    if fused:
+        assert [t[0] for t in full].count("fused") == num_chunks
+        assert all(t[1] == 0 for t in forwards)
+    for num_real in range(num_chunks):
+        padded = _lockstep_draft_trace(
+            monkeypatch, "mtp", K, num_chunks, num_real, fused, draft_rows
+        )
+        assert padded == full, f"{num_real} of {num_chunks} chunks real"
+
+
+def test_dp_fused_loop_needs_adapter_metadata_under_lockstep():
+    """Without model-owned padding metadata the rebuilt loop metadata may not
+    fit the fused program, so lockstep keeps the per-step loop."""
+    proposer = _make_proposer(draft_tp=2, target_tp=2, method="mtp")
+    proposer.runner = SimpleNamespace(_dp_lockstep_enabled=lambda: True)
+    assert proposer._dp_fused_loop() is False
+    proposer._mtp_fused_loop = object()
+    assert proposer._dp_fused_loop() is False
+    proposer.runner.model_adapter = SimpleNamespace(draft_idle_metadata=lambda *a: {})
+    assert proposer._dp_fused_loop() is True
+    proposer.runner = SimpleNamespace(_dp_lockstep_enabled=lambda: False)
+    assert proposer._dp_fused_loop() is True
+
+
+def test_draft_moe_declared_by_attribute():
+    """A draft outside vLLM's MixtureOfExperts interface (Qwen4ExpMTP) that
+    declares MoE layers pairs under EP-DP lockstep even when replicated."""
+    proposer = _make_proposer(draft_tp=1, target_tp=1, method="mtp")
+    proposer.runner = SimpleNamespace(_dp_lockstep_enabled=lambda: True)
+    proposer.draft_model = SimpleNamespace(has_moe_layers=True)
+    assert proposer._dp_lockstep_sharded() is True
 
 
 def test_loop_bucket_constant_under_sharded_lockstep():
