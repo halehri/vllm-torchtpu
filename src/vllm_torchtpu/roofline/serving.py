@@ -54,10 +54,20 @@ def plan(
     """Compute ConcurrencyRow ceilings across a list of concurrencies."""
     chips = par.tp / float(tensor_cores_per_chip)
     tokens = 1.0 if spec_window == 0 else float(acceptance_length)
+    lat_s = (collective_latency_us or 0.0) * 1e-6
     rows_out: list[ConcurrencyRow] = []
     for c in concurrencies:
         if spec_window > 0:
-            sf = spec_cycle_floor(geom, chip, par, c, context, spec_window, dt)
+            sf = spec_cycle_floor(
+                geom,
+                chip,
+                par,
+                c,
+                context,
+                spec_window,
+                dt,
+                collective_latency_s=lat_s,
+            )
         else:
             sf = step_floor(
                 geom,
@@ -65,20 +75,14 @@ def plan(
                 par,
                 StepShape(batch=c, rows_per_seq=1, context=context),
                 dt,
+                collective_latency_s=lat_s,
             )
         hard_ms = sf.hard_floor_s * 1e3
         serial_ms = sf.serial_floor_s * 1e3
         tpot_ms = hard_ms / tokens
         interactivity = 1000.0 / tpot_ms
         output_tput = (c * tokens) / sf.hard_floor_s / chips
-        n_coll = sum(m.n_collectives for m in sf.modules)
-        if (
-            collective_latency_us is not None
-            and n_coll * collective_latency_us * 1e-6 > sf.hard_floor_s
-        ):
-            flag = "MEASURE"
-        else:
-            flag = "-"
+        flag = "MEASURE" if sf.binding == "chain" else "-"
         rows_out.append(
             ConcurrencyRow(
                 c=c,

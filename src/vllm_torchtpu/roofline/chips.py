@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -28,7 +29,7 @@ class ChipSpec:
     bf16_flops: float
     fp8_flops: float
     vmem_bytes: int
-    link_bw: float | None = None
+    ici_bw: float = math.inf
 
 
 CHIPS: dict[str, ChipSpec] = {
@@ -39,6 +40,7 @@ CHIPS: dict[str, ChipSpec] = {
         bf16_flops=1.155e15,
         fp8_flops=2.3e15,
         vmem_bytes=67_108_864,
-        link_bw=None,
+        # per-chip ICI egress of 560.04 GB/s split over 2 TensorCores
+        ici_bw=280.02e9,
     ),
 }

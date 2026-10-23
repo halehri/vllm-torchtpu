@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+import vllm_torchtpu.roofline as rf
 from vllm_torchtpu.roofline import (
     CHIPS,
     ChipSpec,
@@ -57,6 +58,8 @@ QWEN35_CFG: dict[str, object] = {
     }
 }
 
+DOC_DTYPES = Dtypes(kv=2.0, w_aux=1.0)
+
 
 def test_qwen35_batch1_bytes_match_worked_example() -> None:
     geom = from_hf_config(QWEN35_CFG)
@@ -64,9 +67,9 @@ def test_qwen35_batch1_bytes_match_worked_example() -> None:
         m.name: m
         for m in pass_costs(
             geom,
-            Parallel(tp=8, kv_path="standard"),
+            Parallel(tp=8),
             StepShape(batch=1, rows_per_seq=1, context=90036),
-            Dtypes(),
+            DOC_DTYPES,
         )
     }
     assert mods["gqa"].hbm_bytes == pytest.approx(220_200_960 + 1_382_952_960, abs=1.0)
@@ -85,9 +88,9 @@ def test_fused_path_splits_kv_in_group() -> None:
         m.name: m
         for m in pass_costs(
             geom,
-            Parallel(tp=8, kv_path="fused"),
+            Parallel(tp=8, kv_split=4),
             StepShape(batch=1, rows_per_seq=1, context=90036),
-            Dtypes(),
+            DOC_DTYPES,
         )
     }
     assert mods["gqa"].hbm_bytes == pytest.approx(220_200_960 + 345_738_240, abs=1.0)
@@ -102,7 +105,7 @@ def test_hard_floor_is_max_of_resources() -> None:
         CHIPS["tpu7x"],
         Parallel(tp=8),
         StepShape(batch=1, rows_per_seq=1, context=90036),
-        Dtypes(),
+        DOC_DTYPES,
     )
     assert sf.hard_floor_s == max(sf.hbm_s, sf.mm_s, sf.ici_s)
     assert sf.binding == "hbm"
@@ -111,7 +114,7 @@ def test_hard_floor_is_max_of_resources() -> None:
 
     tiny_mm = ChipSpec("tiny_mm", 100, 1e18, 1e6, 1e6, 100)
     sf_mm = step_floor(
-        geom, tiny_mm, Parallel(tp=8), StepShape(batch=1, context=10), Dtypes()
+        geom, tiny_mm, Parallel(tp=8), StepShape(batch=1, context=10), DOC_DTYPES
     )
     assert sf_mm.binding == "matmul"
 
@@ -133,12 +136,12 @@ def test_collective_payload_and_count() -> None:
     mods1 = pass_costs(
         geom, Parallel(tp=8), StepShape(batch=1, rows_per_seq=1), Dtypes()
     )
-    assert sum(m.n_collectives for m in mods1) == 120
-    assert sum(m.ici_bytes for m in mods1) == pytest.approx(120 * 8192)
+    assert sum(m.n_collectives for m in mods1) == 122
+    assert sum(m.ici_bytes for m in mods1) == pytest.approx(6_319_872.0)
     mods4 = pass_costs(
         geom, Parallel(tp=8), StepShape(batch=1, rows_per_seq=4), Dtypes()
     )
-    assert sum(m.ici_bytes for m in mods4) / 120 == pytest.approx(32768)
+    assert sum(m.ici_bytes for m in mods4) == pytest.approx(25_279_488.0)
     mods_tp1 = pass_costs(
         geom, Parallel(tp=1), StepShape(batch=1, rows_per_seq=1), Dtypes()
     )
@@ -152,7 +155,7 @@ def test_spec_rows_and_tokens_per_step() -> None:
         geom,
         CHIPS["tpu7x"],
         Parallel(tp=8),
-        Dtypes(),
+        DOC_DTYPES,
         context=90036,
         concurrencies=[1, 4],
         spec_window=3,
@@ -164,7 +167,13 @@ def test_spec_rows_and_tokens_per_step() -> None:
     )
     assert experts_touched(512, 10, 4) == pytest.approx(38.84330928325653, rel=1e-12)
     cyc = spec_cycle_floor(
-        geom, CHIPS["tpu7x"], Parallel(tp=8), batch=1, context=90036, k=3
+        geom,
+        CHIPS["tpu7x"],
+        Parallel(tp=8),
+        batch=1,
+        context=90036,
+        k=3,
+        dt=DOC_DTYPES,
     )
     assert sum(m.hbm_bytes for m in cyc.modules) == pytest.approx(
         7_813_585_288.75, abs=1.0
@@ -219,12 +228,11 @@ def test_qwen38_tp32_subtile_replication() -> None:
         m.name: m
         for m in pass_costs(
             geom,
-            Parallel(tp=32, kv_path="standard"),
+            Parallel(tp=32),
             StepShape(batch=1, rows_per_seq=1, context=1024),
-            Dtypes(weight=1.0),
+            DOC_DTYPES,
         )
     }
-    # At tp=32: kh=1, vh=4, qkv_r=768, isr=128
     expected_gdn_w = 48 * (6144 * (768 + 512) + 6144 * 8 + 768 * 4 + 512 * 6144)
     expected_gdn_st = 2 * 48 * (4 * 128 * 128 * 4 + 768 * 3 * 2)
     assert mods["gdn"].hbm_bytes == pytest.approx(
@@ -234,7 +242,6 @@ def test_qwen38_tp32_subtile_replication() -> None:
     expected_moe_w = 64 * (ed1 * 3 * 6144 * 64 + 3 * 6144 * 128 + 6144 * 512 * 2)
     assert mods["moe"].hbm_bytes == pytest.approx(expected_moe_w, abs=1.0)
 
-    # Zero-guard check: non-hybrid attention-only model with shared_inter=0
     dense_att_cfg = {
         "hidden_size": 4096,
         "num_hidden_layers": 4,
@@ -286,3 +293,172 @@ def test_non_hybrid_models_omit_absent_blocks_and_interval_layer_types() -> None
         for m in pass_costs(pure_lin_geom, Parallel(tp=8), StepShape(), Dtypes())
     }
     assert "gqa" not in pure_lin_mods and "gdn" in pure_lin_mods
+
+
+def test_ep_busiest_rank_closed_form() -> None:
+    expected = (
+        (1, 2.979897),
+        (4, 8.031072),
+        (16, 22.468799),
+        (64, 50.896276),
+        (256, 63.999832),
+    )
+    prev = 0.0
+    for rows, val in expected:
+        got = rf.ep_busiest_experts(512, 10, rows, 8)
+        assert got == pytest.approx(val, abs=1e-6)
+        assert got > prev
+        assert got <= 64.0
+        prev = got
+    assert rf.ep_busiest_experts(512, 10, 4, 1) == pytest.approx(
+        experts_touched(512, 10, 4), rel=1e-12
+    )
+    assert rf.ep_busiest_experts(0, 10, 4, 8) == 0.0
+
+
+def test_stock_plan_ep_fp8kv_batch1_bytes() -> None:
+    geom = from_hf_config(QWEN35_CFG)
+    mods = pass_costs(
+        geom,
+        Parallel(tp=8, moe="ep"),
+        StepShape(batch=1, rows_per_seq=1, context=90036),
+        Dtypes(),
+    )
+    by_name = {m.name: m for m in mods}
+    assert by_name["moe"].hbm_bytes == pytest.approx(2_595_776_984.77, abs=1.0)
+    assert sum(m.hbm_bytes for m in mods) == pytest.approx(4_476_803_544.77, abs=1.0)
+
+
+def test_sequence_parallel_replicates_shared_expert() -> None:
+    geom = from_hf_config(QWEN35_CFG)
+    shape = StepShape(batch=1, rows_per_seq=1, context=90036)
+    stock = {
+        m.name: m for m in pass_costs(geom, Parallel(tp=8, moe="ep"), shape, Dtypes())
+    }
+    sp = {
+        m.name: m
+        for m in pass_costs(
+            geom, Parallel(tp=8, moe="ep", residual="sp"), shape, Dtypes()
+        )
+    }
+    assert sp["moe"].hbm_bytes - stock["moe"].hbm_bytes == pytest.approx(
+        660_602_880.0, abs=1.0
+    )
+
+
+def test_library_defaults_batch1_bytes() -> None:
+    geom = from_hf_config(QWEN35_CFG)
+    mods = pass_costs(
+        geom,
+        Parallel(tp=8, kv_split=4),
+        StepShape(batch=1, rows_per_seq=1, context=90036),
+        Dtypes(state=2.0),
+    )
+    assert sum(m.hbm_bytes for m in mods) == pytest.approx(2_628_574_720.0, abs=1.0)
+
+
+def test_ar_algorithm_wire_and_hops() -> None:
+    geom = from_hf_config(QWEN35_CFG)
+    shape = StepShape(batch=1, rows_per_seq=4)
+    cases = (
+        ("one_shot", 122, 29_492_736.0, 122),
+        ("two_shot", 122, 8_676_864.0, 243),
+        ("ring", 122, 8_676_864.0, 1701),
+    )
+    for algo, count, wire, hops in cases:
+        mods = pass_costs(geom, Parallel(tp=8, ar_algo=algo), shape, Dtypes())
+        colls = [c for m in mods for c in m.collectives]
+        assert len(colls) == count
+        assert sum(c.wire_bytes for c in colls) == pytest.approx(wire, abs=1.0)
+        assert sum(c.hops for c in colls) == hops
+
+
+def test_sequence_parallel_collective_count() -> None:
+    geom = from_hf_config(QWEN35_CFG)
+    mods = pass_costs(
+        geom,
+        Parallel(tp=8, moe="ep", residual="sp"),
+        StepShape(batch=1, rows_per_seq=4),
+        Dtypes(),
+    )
+    colls = [c for m in mods for c in m.collectives]
+    assert len(colls) == 303
+    assert sum(c.wire_bytes for c in colls) == pytest.approx(16_217_600.0, abs=1.0)
+    assert sum(c.hops for c in colls) == 303
+
+
+def test_a2a_push_wire_bytes() -> None:
+    geom = from_hf_config(QWEN35_CFG)
+    shape = StepShape(batch=1, rows_per_seq=4)
+    rep = pass_costs(
+        geom,
+        Parallel(tp=8, moe="ep", moe_dispatch="a2a_push"),
+        shape,
+        Dtypes(),
+    )
+    rep_c = [c for m in rep for c in m.collectives]
+    assert len(rep_c) == 242
+    assert sum(c.wire_bytes for c in rep_c) == pytest.approx(21_751_296.0, abs=1.0)
+    sp = pass_costs(
+        geom,
+        Parallel(tp=8, moe="ep", moe_dispatch="a2a_push", residual="sp"),
+        shape,
+        Dtypes(),
+    )
+    sp_c = [c for m in sp for c in m.collectives]
+    assert len(sp_c) == 243
+    assert sum(c.wire_bytes for c in sp_c) == pytest.approx(13_207_040.0, abs=1.0)
+
+
+def test_kv_split_adds_merge_collectives() -> None:
+    geom = from_hf_config(QWEN35_CFG)
+    shape = StepShape(batch=1, rows_per_seq=4)
+    ag_rs = pass_costs(
+        geom, Parallel(tp=8, kv_split=4, kv_merge="ag_rs"), shape, Dtypes()
+    )
+    c1 = [c for m in ag_rs for c in m.collectives]
+    assert len(c1) == 167
+    assert sum(c.wire_bytes for c in c1) == pytest.approx(30_610_176.0, abs=1.0)
+    xchg = pass_costs(
+        geom, Parallel(tp=8, kv_split=4, kv_merge="exchange"), shape, Dtypes()
+    )
+    c2 = [c for m in xchg for c in m.collectives]
+    assert len(c2) == 137
+    assert sum(c.wire_bytes for c in c2) == pytest.approx(30_967_296.0, abs=1.0)
+
+
+def test_chain_term_binds_with_latency() -> None:
+    geom = from_hf_config(QWEN35_CFG)
+    shape = StepShape(batch=1, rows_per_seq=4, context=0)
+    sf0 = step_floor(geom, CHIPS["tpu7x"], Parallel(tp=8), shape, Dtypes(), 0.0)
+    assert sf0.chain_s == pytest.approx(9.027743733e-05, rel=1e-6)
+    assert sf0.binding == "hbm"
+    sf1 = step_floor(geom, CHIPS["tpu7x"], Parallel(tp=8), shape, Dtypes(), 15.4e-6)
+    assert sf1.chain_s == pytest.approx(1.969077437e-03, rel=1e-6)
+    assert sf1.binding == "chain"
+    assert sf1.hard_floor_s == pytest.approx(sf1.chain_s, rel=1e-12)
+
+
+def test_a16_routes_fp8_weights_to_bf16_peak() -> None:
+    geom = from_hf_config(QWEN35_CFG)
+    shape = StepShape(batch=1, rows_per_seq=1, context=0)
+    m_a8 = pass_costs(geom, Parallel(tp=8), shape, Dtypes(act="a8"))
+    m_a16 = pass_costs(geom, Parallel(tp=8), shape, Dtypes(act="a16"))
+    assert sum(m.fp8_flops for m in m_a8) > 0.0
+    assert sum(m.fp8_flops for m in m_a16) == 0.0
+    tot_a8 = sum(m.fp8_flops + m.bf16_flops for m in m_a8)
+    tot_a16 = sum(m.fp8_flops + m.bf16_flops for m in m_a16)
+    assert tot_a16 == pytest.approx(tot_a8, rel=1e-12)
+
+
+def test_invalid_plans_raise() -> None:
+    geom = from_hf_config(QWEN35_CFG)
+    shape = StepShape(batch=1, rows_per_seq=1)
+    for bad in (
+        Parallel(tp=8, kv_split=3),
+        Parallel(tp=8, moe="tp_slice", residual="sp"),
+        Parallel(tp=8, moe="tp_slice", moe_dispatch="a2a_push"),
+        Parallel(tp=1, moe="ep", residual="sp"),
+    ):
+        with pytest.raises(ValueError):
+            pass_costs(geom, bad, shape, Dtypes())

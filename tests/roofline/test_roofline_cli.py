@@ -60,6 +60,10 @@ def test_cli_plan_json_schema(
             "8",
             "--context",
             "90036",
+            "--kv-dtype",
+            "bf16",
+            "--aux-dtype",
+            "fp8",
             "--concurrency",
             "1,4",
             "--json",
@@ -83,6 +87,7 @@ def test_cli_plan_json_schema(
         assert set(row.keys()) == expected_keys
     assert out[0]["c"] == 1
     assert out[0]["hard_floor_ms"] == pytest.approx(1.0429799783783784, rel=1e-9)
+
 
 def test_cli_explain_json_and_spec_window(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -115,3 +120,29 @@ def test_cli_rejects_non_positive_tp(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="--tp must be >= 1"):
         cli.main(["explain", "--config", str(cfg_path), "--tp", "0"])
 
+
+def test_cli_plan_axes_flags(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps(QWEN35_CFG))
+    rc = cli.main(
+        [
+            "explain",
+            "--config",
+            str(cfg_path),
+            "--tp",
+            "8",
+            "--context",
+            "90036",
+            "--moe",
+            "ep",
+            "--kv-dtype",
+            "fp8",
+            "--json",
+        ]
+    )
+    assert rc == 0
+    mods = json.loads(capsys.readouterr().out)
+    total = sum(m["hbm_bytes"] for m in mods)
+    assert total == pytest.approx(4_476_803_544.77, abs=1.0)

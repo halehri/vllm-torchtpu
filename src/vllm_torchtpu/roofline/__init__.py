@@ -16,12 +16,14 @@
 from __future__ import annotations
 
 from .chips import CHIPS, ChipSpec
+from .collectives import Collective
 from .geometry import ModelGeometry, from_hf_config
 from .modules import (
     Dtypes,
     ModuleCost,
     Parallel,
     StepShape,
+    ep_busiest_experts,
     experts_touched,
     pass_costs,
 )
@@ -31,6 +33,7 @@ from .step import StepFloor, spec_cycle_floor, step_floor
 __all__ = [
     "CHIPS",
     "ChipSpec",
+    "Collective",
     "ConcurrencyRow",
     "Dtypes",
     "ModelGeometry",
@@ -38,6 +41,7 @@ __all__ = [
     "Parallel",
     "StepFloor",
     "StepShape",
+    "ep_busiest_experts",
     "experts_touched",
     "from_hf_config",
     "pass_costs",
