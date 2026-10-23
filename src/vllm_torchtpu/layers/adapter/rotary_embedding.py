@@ -74,12 +74,12 @@ class TpuApplyRotaryEmb(ApplyRotaryEmb):
             **kwargs,
         )
 
-    def forward_oot(
+    def forward_oot(  # pyrefly: ignore[bad-override]
         self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
     ) -> torch.Tensor:
         return self.forward_native(x, cos, sin)
 
-    forward_tpu = forward_oot
+    forward_tpu = forward_oot  # pyrefly: ignore[bad-override]
 
 
 def _rotary_forward_fp32(
