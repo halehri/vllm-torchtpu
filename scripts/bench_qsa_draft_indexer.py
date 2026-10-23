@@ -94,5 +94,21 @@ def test_draft_indexer():
     Path(out, "bench_qsa_draft_indexer.json").write_text(json.dumps(results, indent=1))
 
 
+def test_draft_indexer_xprof():
+    """One traced run per (rows, block) for the op breakdown."""
+    rng = np.random.default_rng(1)
+    pool = (
+        jax.random.normal(jax.random.key(0), (POOL_PAGES, PAGE, 1, 4, 256))
+        .astype(jnp.float8_e4m3fn)
+    )
+    out = os.environ.get("CDK_OUTPUT_DIR", "/tmp")
+    for rows, max_ctx, block in ((4, 16384, 1024), (4, 65536, 1024), (32, 65536, 1024)):
+        args = make(rng, rows, max_ctx)
+        run(pool, args, block)
+        with jax.profiler.trace(os.path.join(out, "xprof", f"r{rows}_c{max_ctx}_b{block}")):
+            us, _ = run(pool, args, block)
+        print("IDX", json.dumps(dict(rows=rows, max_ctx=max_ctx, block=block, us=us)))
+
+
 if __name__ == "__main__":
     test_draft_indexer()
