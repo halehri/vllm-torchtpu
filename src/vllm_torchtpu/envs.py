@@ -87,6 +87,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_FUSED_KV_WRITE: bool = False
     VLLM_TPU_QSA_INDEXER_SHARD: bool = False
     VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS: int = 0
+    VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
+    VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -492,6 +494,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # blocks, instead of all-gathering every rank's candidates. 0: never.
     "VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS": env_nonnegative_int(
         "VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS", 0
+    ),
+    # Qwen4-exp QSA prefill: build the per-query selection bitset with a
+    # compare-and-accumulate Pallas kernel. Off falls back to the vmapped
+    # scatter-add, which XLA:TPU lowers to a global sort of every selection.
+    "VLLM_TPU_QSA_PREFILL_BITSET_KERNEL": env_bool(
+        "VLLM_TPU_QSA_PREFILL_BITSET_KERNEL", default=True
+    ),
+    # Qwen4-exp QSA prefill attention: feed the MXU BF16 operands (exact
+    # queries and keys, probabilities split into two BF16 terms) instead of
+    # FP32 operands, which Mosaic multiplies at full FP32 precision.
+    "VLLM_TPU_QSA_PREFILL_BF16_MXU": env_bool(
+        "VLLM_TPU_QSA_PREFILL_BF16_MXU", default=False
     ),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
