@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK: int = 256
     VLLM_TPU_MTP_DRAFT_TOP_TOKENS: bool = False
     VLLM_TPU_QSA_RING_SELECT: bool = False
+    VLLM_TPU_GDN_HOIST_READ_OFFSETS: bool = False
     VLLM_TPU_QSA_RING_DMA_BATCH: int = 0
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
@@ -485,6 +486,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Qwen4-exp pooled QSA: request row r owns ring row r, so the indexer
     # update's whole-row ring/tag gathers and final scatter become selects.
     "VLLM_TPU_QSA_RING_SELECT": env_bool("VLLM_TPU_QSA_RING_SELECT", default=False),
+    # Pooled GDN with speculative decoding: gather each sequence's checkpoint
+    # read offset (slot_read_offsets[state_indices]) in the step graph rather
+    # than inside every layer's op, so XLA keeps one gather per step.
+    "VLLM_TPU_GDN_HOIST_READ_OFFSETS": env_bool(
+        "VLLM_TPU_GDN_HOIST_READ_OFFSETS", default=False
+    ),
     # Qwen4-exp QSA ring/tag state I/O: concurrent row DMAs per tile. 0 uses
     # the measured table (pool pages without an entry, e.g. 512-token FP8
     # pages, fall back to one serial DMA per request); N > 0 uses the largest

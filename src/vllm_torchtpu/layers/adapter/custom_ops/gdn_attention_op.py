@@ -34,6 +34,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.block_major_pool import (
     BlockMajorPoolLayout,
     flat_manager_ids,
@@ -200,6 +201,7 @@ def gdn_attention_pooled_core_tpu(
     recurrent_state_dtype: jnp.dtype,
     conv_state_dtype: jnp.dtype = jnp.bfloat16,
     num_spec_tokens: int = 0,
+    read_offsets_per_seq: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     return run_jax_gdn_attention_pooled(
         mixed_qkv,
@@ -226,6 +228,7 @@ def gdn_attention_pooled_core_tpu(
         conv_state_dtype=conv_state_dtype,
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
+        read_offsets_per_seq=read_offsets_per_seq,
     )
 
 
@@ -741,6 +744,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # the request's state block; rejected drafts are rolled back by
         # checkpoint selection (see TPUModelRunner.mamba_slot_read_offsets).
         num_spec_tokens = self.num_spec
+        # Gather each sequence's read offset in the step graph, outside the
+        # per-layer op: the gather is then identical across GDN layers and
+        # XLA keeps one per step instead of one per layer.
+        hoist_read_offsets = envs.VLLM_TPU_GDN_HOIST_READ_OFFSETS
 
         # Written out rather than functools.partial so pool_block_tokens is
         # read per call instead of at build time; pallas.jax_op requires a
@@ -797,6 +804,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 recurrent_state_dtype=recurrent_state_dtype,
                 conv_state_dtype=conv_state_dtype,
                 num_spec_tokens=num_spec_tokens,
+                read_offsets_per_seq=hoist_read_offsets,
             )
             if not block_major:
                 return result
@@ -833,6 +841,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 recurrent_state_dtype,
                 conv_state_dtype,
                 num_spec_tokens,
+                hoist_read_offsets,
             ),
             build_op,
         )
@@ -853,6 +862,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             slot_read_offsets: torch.Tensor | None = None,
             ckpt_indices: torch.Tensor | None = None,
         ) -> torch.Tensor:
+            if hoist_read_offsets and slot_read_offsets is not None:
+                slot_read_offsets = slot_read_offsets[state_indices]
             new_rec, outputs = gdn_jax_op(
                 mixed_qkv,
                 b,
