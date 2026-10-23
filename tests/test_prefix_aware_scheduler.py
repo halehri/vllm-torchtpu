@@ -208,3 +208,36 @@ def test_coordinator_failure_falls_back_to_fcfs():
     assert q is not None
     assert [r.request_id for r in q] == ["r1", "r2"]
     assert s._paw_scoring_broken is True
+
+
+def test_decode_interleave_defers_prefills_on_n_minus_1_of_n_steps():
+    s = _make_scheduler([], {})
+    s._decode_interleave = 3
+    s._interleave_step = 0
+    s.prefill_capacity_bound = True
+    seen = []
+
+    def fake_schedule(self, throttle_prefills=False):
+        seen.append((throttle_prefills, self.prefill_capacity_bound))
+        return None
+
+    with patch.object(AsyncScheduler, "schedule", fake_schedule):
+        for _ in range(6):
+            s.prefill_capacity_bound = True
+            s.schedule()
+    assert [t for t, _ in seen] == [True, True, False, True, True, False]
+    # Throttled steps clear the saturation flag so deferral still applies.
+    assert all(not cap for t, cap in seen if t)
+
+
+def test_decode_interleave_off_by_default():
+    s = _make_scheduler([], {})
+    seen = []
+
+    def fake_schedule(self, throttle_prefills=False):
+        seen.append(throttle_prefills)
+
+    with patch.object(AsyncScheduler, "schedule", fake_schedule):
+        for _ in range(3):
+            s.schedule()
+    assert seen == [False, False, False]

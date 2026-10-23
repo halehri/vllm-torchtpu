@@ -40,6 +40,8 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.request import Request
 
+from vllm_torchtpu import envs
+
 logger = init_logger("vllm." + __name__)
 
 _LOG_EVERY = 1000
@@ -61,8 +63,14 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_cold_tokens = 0
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
+        self._interleave_step = 0
+        self._decode_interleave = max(1, envs.VLLM_TPU_DECODE_INTERLEAVE)
 
-        logger.info("PrefixAwareScheduler ACTIVE (window=%d)", self.WINDOW)
+        logger.info(
+            "PrefixAwareScheduler ACTIVE (window=%d, decode interleave=%d)",
+            self.WINDOW,
+            self._decode_interleave,
+        )
 
     def _prefix_warmth(self, request: Request) -> int:
         """Prompt tokens of ``request`` resident in the KV cache."""
@@ -107,6 +115,18 @@ class PrefixAwareScheduler(AsyncScheduler):
         )
         if queue is not None:
             self._promote_warmest(queue)
+        interleave = getattr(self, "_decode_interleave", 1)
+        if interleave > 1 and not throttle_prefills:
+            # Decode-priority interleave: of every N steps, N - 1 defer all
+            # prefill work (new admissions and in-progress chunks) whenever a
+            # decode is running, so decodes advance every ~decode-step
+            # instead of once per full prefill chunk. Uses the scheduler's own
+            # prefill deferral (built for DP prefill balancing); clearing
+            # prefill_capacity_bound keeps it deferring under saturation.
+            self._interleave_step += 1
+            if self._interleave_step % interleave:
+                self.prefill_capacity_bound = False
+                throttle_prefills = True
         return super().schedule(throttle_prefills)
 
     def _promote_warmest(self, queue: RequestQueue) -> None:

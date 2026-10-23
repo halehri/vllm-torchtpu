@@ -192,6 +192,7 @@ if TYPE_CHECKING:
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
+    VLLM_TPU_DECODE_INTERLEAVE: int = 1
     VLLM_TPU_FUSED_ASYNC_DRAFT_SEED: bool = True
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
     VLLM_TPU_MTP_DRAFT_ROWS: bool = False
@@ -1209,6 +1210,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
     "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
+    # PrefixAwareScheduler: of every N steps, N - 1 defer prefill work while a
+    # decode is running (decode-priority interleave). 1 = off.
+    "VLLM_TPU_DECODE_INTERLEAVE": env_int("VLLM_TPU_DECODE_INTERLEAVE", 1),
     # Async spec decode: derive the draft seed (token, position, rejected
     # count) from the rejection-sampler output in one compiled program per
     # request-padding bucket instead of ~15 eager ones (eagle3.py
