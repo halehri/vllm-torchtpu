@@ -58,6 +58,7 @@ from .ple_storage import SharedPLEOptions
 from .pool_layout import POOLED_GDN_CONV_STATE_DTYPE
 from .pooled_ple import Qwen4ExpPooledPLE
 from .qsa import QSAMetadata, Qwen4ExpQSA
+from . import sequence_parallel as sp
 
 
 def _parameter_storage_key(parameter):
@@ -219,6 +220,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 gqa_interleaved_layout=False,
                 pooled_conv_state_dtype=POOLED_GDN_CONV_STATE_DTYPE,
             )
+            # The layer sums the TP partial outputs itself: an all-reduce on
+            # the replicated path, a reduce-scatter on the sequence-parallel
+            # one (see ``sequence_parallel``).
+            out_proj = getattr(self.linear_attn, "out_proj", None)
+            if out_proj is not None:
+                out_proj.reduce_results = False
         else:
             self.self_attn = Qwen4ExpQSA(
                 config=t,
@@ -270,7 +277,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
         main_block_table,
         compressed_block_table,
         ple_raw_embeddings=None,
+        sequence_parallel=False,
     ):
+        """``sequence_parallel``: ``hidden`` and the result are this TP rank's
+        token shard; the token-indexed inputs still cover the whole step."""
+        num_tokens = input_ids.shape[0] if sequence_parallel else None
         if self.ple is not None:
             ple_slots = state_slots
             speculative = None
@@ -290,12 +301,15 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 query_start_loc[-1:],
                 ple_raw_embeddings,
                 speculative,
+                sequence_parallel=sequence_parallel,
             )
         block, residual = self.attn_hyper_connection.mix(hidden)
+        if sequence_parallel:
+            block = sp.gather(block, num_tokens)
         if self.layer_type == "linear_attention":
-            block = self.linear_attn(block)
+            block = sp.reduce(self.linear_attn(block), sequence_parallel)
         else:
-            block = self.self_attn(
+            block = self.self_attn.forward_with_indices(
                 block,
                 positions,
                 QSAMetadata(
@@ -305,12 +319,58 @@ class Qwen4ExpDecoderLayer(nn.Module):
                     main_block_table,
                     compressed_block_table,
                 ),
-            )
+                reduce=False,
+            )[0]
+            block = sp.reduce(block, sequence_parallel)
         hidden = self.attn_hyper_connection.combine(block, residual)
         block, residual = self.mlp_hyper_connection.mix(hidden)
         # GDN may leave padded rows unwritten; MoE dispatch requires finite inputs.
+        if sequence_parallel:
+            valid_tokens = sp.shard(valid_tokens[:, None])[:, 0]
         block = torch.where(valid_tokens[:, None], block, 0)
-        return self.mlp_hyper_connection.combine(self.mlp(block), residual)
+        if sequence_parallel:
+            moe = self._sequence_parallel_moe(block, num_tokens)
+        else:
+            moe = self.mlp(block)
+        return self.mlp_hyper_connection.combine(moe, residual)
+
+    def _sequence_parallel_moe(self, block, num_tokens):
+        """The MoE block's output at this rank's rows of a sharded step.
+
+        With a token-sharded adaptive EP op (QWEN4_EXP_PREFILL_SP_MOE=1) the
+        routed experts take this rank's rows directly and the TP-sliced
+        shared expert's partial sum is reduce-scattered: the same terms
+        MoERunner adds, (all-reduced shared) + (routed). Otherwise the block
+        runs on the gathered rows (its EP kernel takes replicated rows and
+        returns them reduced) and this rank keeps its rows.
+        """
+        mlp = self.mlp
+        routed = getattr(getattr(mlp, "experts", None), "routed_experts", None)
+        method = getattr(routed, "quant_method", None)
+        if (
+            not envs.QWEN4_EXP_PREFILL_SP_MOE
+            or getattr(method, "_adaptive_fused_moe_op_sp", None) is None
+            or getattr(mlp, "shared_expert", None) is None
+            or getattr(mlp, "replicate_shared_expert", True)
+        ):
+            return sp.shard(mlp(sp.gather(block, num_tokens)))
+        from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
+            vllm_adapter as adaptive_moe,
+        )
+
+        router_logits, _ = mlp.gate(block)
+        output = adaptive_moe.run_adaptive_fused_moe(
+            method,
+            block,
+            routed.w13_weight,
+            routed.w2_weight,
+            routed.w13_weight_scale_inv,
+            routed.w2_weight_scale_inv,
+            router_logits,
+            attr="_adaptive_fused_moe_op_sp",
+        )
+        shared = sp.reduce(mlp.shared_expert(sp.gather(block, num_tokens)), True)
+        return shared + output
 
     def forward_rows(
         self,
@@ -442,6 +502,13 @@ class Qwen4ExpBackbone(nn.Module):
         hidden = (
             self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         )
+        num_tokens = input_ids.shape[0]
+        sequence_parallel = sp.sequence_parallel_eligible(
+            num_tokens, sp.tp_world_size()
+        )
+        if sequence_parallel:
+            sp.check_divisible(num_tokens)
+            hidden = sp.shard(hidden)
         hidden = hidden.repeat(1, self.hc_count)
         for layer in self.layers:
             hidden = layer(
@@ -456,8 +523,13 @@ class Qwen4ExpBackbone(nn.Module):
                 main_block_table,
                 compressed_block_table,
                 ple_raw_embeddings,
+                sequence_parallel=sequence_parallel,
             )
         mixed = self.hyper_connection_mixer.mix(hidden)[0]
+        if sequence_parallel:
+            mixed = sp.gather(mixed, num_tokens)
+            if self.emit_mtp_hidden:
+                hidden = sp.gather(hidden, num_tokens)
         if self.emit_mtp_hidden:
             return mixed, hidden
         return mixed

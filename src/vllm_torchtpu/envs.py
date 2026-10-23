@@ -56,6 +56,9 @@ if TYPE_CHECKING:
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
+    QWEN4_EXP_PREFILL_SP: bool = False
+    QWEN4_EXP_PREFILL_SP_MIN_TOKENS: int = 1024
+    QWEN4_EXP_PREFILL_SP_MOE: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -647,6 +650,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # T/tp tokens, and the next layer all-gathers. Qwen3.5 MoE with
     # EP and TP > 1 only.
     "TPU_MOE_SEQUENCE_PARALLEL": env_bool("TPU_MOE_SEQUENCE_PARALLEL", default=False),
+    # qwen4_exp: shard prefill-sized steps across TP ranks between attention
+    # blocks (reduce-scatter instead of all-reduce), so the hyper-connection
+    # streams, PLE gate and residual math run on 1/TP of the tokens. Steps
+    # below QWEN4_EXP_PREFILL_SP_MIN_TOKENS keep the replicated TP path.
+    "QWEN4_EXP_PREFILL_SP": env_bool("QWEN4_EXP_PREFILL_SP"),
+    "QWEN4_EXP_PREFILL_SP_MIN_TOKENS": env_int(
+        "QWEN4_EXP_PREFILL_SP_MIN_TOKENS", 1024
+    ),
+    # With QWEN4_EXP_PREFILL_SP=1: the adaptive fused EP MoE takes each
+    # rank's own rows on sequence-parallel steps (no replica split/restore)
+    # and the shared expert's TP sum is reduce-scattered, not all-reduced.
+    "QWEN4_EXP_PREFILL_SP_MOE": env_bool("QWEN4_EXP_PREFILL_SP_MOE"),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
     # one-hot combine; "on" enables the kernel for every shape that passes
