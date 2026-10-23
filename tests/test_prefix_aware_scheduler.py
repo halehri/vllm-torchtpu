@@ -256,3 +256,28 @@ def test_overdue_request_outranks_warm_ones():
     s._max_wait_s = 0.0  # off: warmest first again
     s._promote_warmest(s.waiting)
     assert next(iter(s.waiting)) is r_warm
+
+
+def test_prefix_aware_srpt_scheduler_chains_both_layers():
+    from vllm_torchtpu.core.experimental.srpt_prefill_scheduler import (
+        PrefixAwareSrptScheduler,
+        SrptPrefillScheduler,
+    )
+
+    mro = PrefixAwareSrptScheduler.__mro__
+    assert mro.index(PrefixAwareScheduler) < mro.index(SrptPrefillScheduler)
+    assert mro.index(SrptPrefillScheduler) < mro.index(AsyncScheduler)
+    calls = []
+
+    def srpt_schedule(self, throttle_prefills=False):
+        calls.append(("srpt", throttle_prefills))
+
+    s = _make_scheduler([], {})
+    s.__class__ = PrefixAwareSrptScheduler
+    s._decode_interleave = 2
+    s._interleave_step = 0
+    with patch.object(SrptPrefillScheduler, "schedule", srpt_schedule):
+        s.schedule()
+        s.schedule()
+    # PAW runs first and forwards its (interleave) throttle decision to SRPT.
+    assert calls == [("srpt", True), ("srpt", False)]
