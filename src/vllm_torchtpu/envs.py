@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
+    VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE: bool = False
     VLLM_TPU_QSA_FUSED_KV_WRITE: bool = False
     VLLM_TPU_QSA_INDEXER_SHARD: bool = False
     VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS: int = 0
@@ -474,6 +475,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel's static envelope (non-TPU7x, unsupported shapes) still use RPA.
     "VLLM_TPU_QSA_FUSED_SPARSE_DECODE": env_bool(
         "VLLM_TPU_QSA_FUSED_SPARSE_DECODE", default=False
+    ),
+    # Qwen4-exp QSA decode/verify attention: present every head slot of the
+    # main KV row (zero queries for the other layer's head) so all QSA layers
+    # share one decode kernel configuration and XLA computes the decode
+    # schedule once per step; RPA also skips its empty mixed pass.
+    "VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE": env_bool(
+        "VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE", default=False
     ),
     # Qwen4-exp pooled QSA decode/verify steps: write main KV, compressed
     # indexer keys and the raw ring/tags of a layer with one Pallas kernel
