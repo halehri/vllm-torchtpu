@@ -372,4 +372,5 @@ def test_shared_stream_lowers_to_one_query_block_per_request(
     with jax.sharding.use_abstract_mesh(mesh):
         text = select.trace(*args).lower(lowering_platforms=("tpu",)).as_text()
     assert f"StreamIdxTC-m-bq_{query_block}-bkvp_{kv_block // 32}" in text
-    assert "StreamIdxTC-d-bq_1-bkvp_8" in text
+    # One mixed pass covers every request; the decode passes are not emitted.
+    assert "StreamIdxTC-d" not in text
