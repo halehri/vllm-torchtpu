@@ -591,7 +591,51 @@ def _exchange_candidates(candidates, tp_group, a2a_min_tokens, merge_op, ratio, 
     return _all_gather_ranks(candidates, tp_group), False
 
 
-def build_pooled_qsa_shard_op(tp_group, a2a_min_tokens: int = 0):
+@functools.cache
+def _shard_group_attend_op():
+    from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
+        pooled_qsa_shard_group_attend_step,
+    )
+
+    attend = pallas.jax_op(
+        "qwen4_exp::pooled_qsa_shard_group_attend",
+        pooled_qsa_shard_group_attend_step,
+        donate_argnums=(7,),
+    )
+
+    @attend.register_fake
+    def fake(
+        q,
+        gate,
+        lengths,
+        req,
+        starts,
+        main_table,
+        context,
+        pool,
+        gathered,
+        group_index,
+        o12,
+        kv_heads,
+        compress_ratio,
+        token_topk,
+        k_scale=1.0,
+        v_scale=1.0,
+        main_slot=-1,
+        max_query_len=1,
+        merged=False,
+        min_tokens=1024,
+    ):
+        return (
+            torch.empty_like(pool),
+            q.new_empty((q.shape[0], o12.shape[1]), dtype=torch.bfloat16),
+            lengths.new_empty((q.shape[0], token_topk + compress_ratio - 1)),
+        )
+
+    return attend
+
+
+def build_pooled_qsa_shard_op(tp_group, a2a_min_tokens: int = 0, group: bool = False):
     """``build_pooled_qsa_op`` with the indexer split across ``tp_group``.
 
     Each rank scores an interleaved 1/TP of every request's compressed keys
@@ -604,6 +648,12 @@ def build_pooled_qsa_shard_op(tp_group, a2a_min_tokens: int = 0):
     The returned callable takes the pooled op's operands plus an optional
     trailing ``rows`` operand (as ``build_pooled_qsa_rows_op``) and a
     ``kv_heads`` keyword.
+
+    ``group`` (VLLM_TPU_QSA_GROUP_SPLIT): the operands end with
+    ``group_index`` and ``o12`` instead of ``rows``, the query operand holds
+    the KV group's 12 heads, a ``min_tokens`` keyword is taken, and the
+    output is this rank's projected ``[T, hidden]`` partial
+    (``pooled_qsa_shard_group_attend_step``).
     """
     world = int(tp_group.world_size)
     rank = int(tp_group.rank_in_group)
@@ -611,14 +661,23 @@ def build_pooled_qsa_shard_op(tp_group, a2a_min_tokens: int = 0):
     # step function's signature, which Dynamo cannot trace inside forward.
     shard_ops = {with_rows: _shard_ops(with_rows) for with_rows in (False, True)}
     merge_op = _merge_op()
+    group_attend = _shard_group_attend_op() if group else None
 
     def run(*args, kv_heads, **kwargs):
         args = list(args)
+        group_args = []
+        if group:
+            group_args = [args[16].to(torch.int32), args[17]]
+            args = args[:16]
+            kwargs = dict(kwargs)
+            min_tokens = kwargs.pop("min_tokens")
         for index in (8, 11, 12, 13, 14, 15, 16):
             if index < len(args):
                 args[index] = args[index].to(torch.int32)
         with_rows = len(args) == 17
         select, attend = shard_ops[with_rows]
+        if group:
+            attend = group_attend
         pool = args[10]
         updated, q, gate, lengths, req, starts, candidates = select(
             *args, shard_rank=rank, shard_size=world, **kwargs
@@ -633,6 +692,8 @@ def build_pooled_qsa_shard_op(tp_group, a2a_min_tokens: int = 0):
             for name in ("k_scale", "v_scale", "main_slot", "max_query_len")
             if name in kwargs
         }
+        if group:
+            attend_kwargs["min_tokens"] = min_tokens
         updated, output, selected = attend(
             q,
             gate,
@@ -644,6 +705,7 @@ def build_pooled_qsa_shard_op(tp_group, a2a_min_tokens: int = 0):
             pool,
             gathered,
             *args[16:],
+            *group_args,
             kv_heads=kv_heads,
             compress_ratio=ratio,
             token_topk=topk,

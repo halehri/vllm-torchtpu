@@ -357,3 +357,55 @@ def test_shard_pages_compose_to_the_select_step(sharded_stand_ins, monkeypatch, 
         np.sort(np.asarray(got_pages), axis=1),
         np.sort(np.asarray(want_pages), axis=1),
     )
+
+
+@pytest.mark.parametrize("merged", [False, True])
+def test_shard_group_attend_composes_to_the_group_step(sharded_stand_ins, monkeypatch, merged):
+    """VLLM_TPU_QSA_INDEXER_SHARD with VLLM_TPU_QSA_GROUP_SPLIT: select ->
+    gather -> merge -> group attention equals the replicated group step, and
+    the group stage sees the merged global blocks."""
+    from vllm_torchtpu.kernels.qwen4_exp import qsa_group
+
+    def group_attention(q, gate, blocks, lengths, table, cache, starts, group_index, o12, **kw):
+        value = q.astype(jnp.float32) * jax.nn.sigmoid(gate.astype(jnp.float32))
+        total = jnp.sum(jnp.where(blocks >= 0, blocks, 0), axis=1)
+        value = value + (total + lengths + starts[-1] + table[:, 0])[:, None, None]
+        value = value + group_index.reshape(()).astype(jnp.float32)
+        partial = jnp.dot(value.reshape(len(q), -1), o12.astype(jnp.float32))
+        return jnp.where((lengths > 0)[:, None], partial, 0).astype(jnp.bfloat16), cache
+
+    monkeypatch.setattr(qsa_group, "group_attention", group_attention)
+    head, pool, tail = mtp_rows._inputs(False, mtp_rows.STARTS, mtp_rows.CONTEXT)
+    options = dict(mtp_rows.OPTIONS, token_topk=256)
+    heads = head[0].shape[1] // (2 * head[4].shape[0])
+    o12 = jnp.asarray(
+        np.random.default_rng(0).normal(size=(heads * head[4].shape[0], 8)), jnp.bfloat16
+    )
+    group_index = jnp.asarray([2], jnp.int32)
+    want_pool, want_out, want_selected = jax.jit(
+        lambda *args: pooled_qsa.pooled_qsa_group_step(*args, **options, min_tokens=1)
+    )(*head, pool, *tail, group_index, o12)
+
+    size = 4
+    results = [
+        jax.jit(
+            lambda *args, rank=rank: pooled_qsa.pooled_qsa_shard_select_step(
+                *args, shard_rank=rank, shard_size=size, **options
+            )
+        )(*head, pool, *tail)
+        for rank in range(size)
+    ]
+    new_pool, q, gate, lengths, req, starts, _ = results[0]
+    gathered = jnp.stack([result[-1] for result in results])
+    if merged:
+        gathered = pooled_qsa.pooled_qsa_shard_merge(gathered, 4, 256)
+    _, out, selected = jax.jit(
+        lambda *args: pooled_qsa.pooled_qsa_shard_group_attend_step(
+            *args, kv_heads=2, compress_ratio=4, token_topk=256, merged=merged,
+            min_tokens=1,
+        )
+    )(q, gate, lengths, req, starts, tail[3], tail[1], new_pool, gathered, group_index, o12)
+    assert out.shape == want_out.shape == (len(q), 8)
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(want_out))
+    for got, expected in zip(np.asarray(selected), np.asarray(want_selected)):
+        np.testing.assert_array_equal(np.sort(got), np.sort(expected))
