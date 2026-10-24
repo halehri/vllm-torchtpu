@@ -127,7 +127,10 @@ class PrefixAwareScheduler(AsyncScheduler):
         the full budget applies.
         """
         decodes = sum(1 for r in self.running if not r.is_prefill_chunk)
-        if decodes == 0:
+        # Only worth splitting prefill when enough decodes wait on it: each
+        # extra prefill step costs a prefill-path fixed cost (~30 ms), which
+        # at low concurrency outweighs what the few decodes gain.
+        if decodes == 0 or decodes < envs.VLLM_TPU_PREFILL_STEP_CAP_MIN_DECODES:
             return super().schedule(throttle_prefills)
         spec = self.vllm_config.speculative_config
         per_decode = 1 + (spec.num_speculative_tokens if spec is not None else 0)

@@ -521,6 +521,7 @@ def test_max_consecutive_holds_env_var_and_compile_cache(
 
 def test_prefill_step_cap_applies_only_while_decoding(shared_model_config, monkeypatch):
     monkeypatch.setenv("VLLM_TPU_PREFILL_STEP_CAP", "16")
+    monkeypatch.setenv("VLLM_TPU_PREFILL_STEP_CAP_MIN_DECODES", "1")
     scheduler, hasher = _build_real_scheduler(
         shared_model_config,
         scheduler_cls=PrefixAwareScheduler,
@@ -550,4 +551,20 @@ def test_prefill_step_cap_off_by_default(shared_model_config):
     scheduler.schedule()
     scheduler.add_request(_make_real_request("long", 128, hasher, seed=1))
     out = scheduler.schedule().num_scheduled_tokens
+    assert out.get("dec") == 1 and out.get("long") == 63
+
+
+def test_prefill_step_cap_waits_for_min_decodes(shared_model_config, monkeypatch):
+    monkeypatch.setenv("VLLM_TPU_PREFILL_STEP_CAP", "16")
+    monkeypatch.setenv("VLLM_TPU_PREFILL_STEP_CAP_MIN_DECODES", "2")
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        scheduler_cls=PrefixAwareScheduler,
+        max_num_batched_tokens=64,
+    )
+    scheduler.add_request(_make_real_request("dec", 8, hasher, seed=3))
+    scheduler.schedule()
+    scheduler.add_request(_make_real_request("long", 128, hasher, seed=1))
+    out = scheduler.schedule().num_scheduled_tokens
+    # One running decode is below the minimum of two: full budget.
     assert out.get("dec") == 1 and out.get("long") == 63
