@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
     VLLM_TPU_GDN_HOIST_READ_OFFSETS: bool = False
+    VLLM_TPU_QSA_BF16_REDUCE_PRECISION: bool = False
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
@@ -472,6 +473,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # than inside every layer's op, so XLA keeps one gather per step.
     "VLLM_TPU_GDN_HOIST_READ_OFFSETS": env_bool(
         "VLLM_TPU_GDN_HOIST_READ_OFFSETS", default=False
+    ),
+    # Qwen4-exp QSA: round to BF16 with lax.reduce_precision instead of the
+    # integer bit trick. Same RNE; the boundary stays observable to XLA and
+    # fuses into neighbouring ops instead of running as its own fusion.
+    "VLLM_TPU_QSA_BF16_REDUCE_PRECISION": env_bool(
+        "VLLM_TPU_QSA_BF16_REDUCE_PRECISION", default=False
     ),
     # Qwen4-exp QSA decode/verify attention: run the decode rows (and the
     # decode prefix of mixed steps) on the fused sparse GQA decode kernel
