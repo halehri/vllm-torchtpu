@@ -1209,26 +1209,32 @@ def _pooled_qsa(
     if shard is not None:
         block_topk = token_topk // compress_ratio
 
-        # Every visible block wins when every row fits the budget; the merge then
-        # never runs on these rows. A select, not a `lax.cond`: the score path's
-        # step-level indexer metadata stays outside any branch, so XLA can CSE
-        # it across the QSA layers (a cond branch is opaque to CSE).
-        all_visible = jnp.max(lengths) // compress_ratio <= block_topk
-        scored = select_blocks(
-            iq,
-            pool,
-            lengths,
-            compressed_table,
-            req,
-            starts,
-            context,
-            ratio=compress_ratio,
-            block_topk=block_topk,
-            slot=compressed_slot,
-            max_query_len=max_query_len,
-            shard=shard,
+        def everything_visible(_):
+            # Every visible block wins; the merge never runs on these rows.
+            return jnp.full((len(iq), block_topk, 2), -1, jnp.int32)
+
+        def score(_):
+            return select_blocks(
+                iq,
+                pool,
+                lengths,
+                compressed_table,
+                req,
+                starts,
+                context,
+                ratio=compress_ratio,
+                block_topk=block_topk,
+                slot=compressed_slot,
+                max_query_len=max_query_len,
+                shard=shard,
+            )
+
+        candidates = jax.lax.cond(
+            jnp.max(lengths) // compress_ratio <= block_topk,
+            everything_visible,
+            score,
+            None,
         )
-        candidates = jnp.where(all_visible, jnp.int32(-1), scored)
         if picked is None and rows is not None:
             # The rows' own decode batch: row i owns main table row req[i].
             req = req_rows
