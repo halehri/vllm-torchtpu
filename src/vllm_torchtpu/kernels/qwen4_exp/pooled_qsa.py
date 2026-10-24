@@ -956,7 +956,7 @@ def _pooled_qsa(
     _parts = _os.environ.get("KVW_DBG_PARTS", "writer+ringread").split("+")
     fused_read = fused and "ringread" in _parts
     fused_writer = fused and "writer" in _parts
-    if not fused_writer:
+    if not fused_writer or "nomain" in _parts:
         pool = write_main_cache(pool, rows_packed, page, logical, valid, **slot_kw)
     ring_rows = math.ceil(compress_ratio / 8) * 8
     ring_elements = ring_rows * raw.shape[-1]
@@ -1001,19 +1001,36 @@ def _pooled_qsa(
             else rows_packed,
             main_page=page,
             main_offset=main_logical,
-            main_valid=valid,
+            main_valid=jnp.zeros_like(valid) if "nomain" in _parts else valid,
             main_slot=main_slot if main_slot >= 0 else None,
             comp_pair=pair,
-            comp_write=write,
+            comp_write=jnp.zeros_like(write) if "nocomp" in _parts else write,
             comp_mask=mask,
             comp_values=values,
             ring=ring.reshape(len(ids), -1),
             tags=tags.reshape(len(ids), -1),
-            ring_ids=ids,
+            ring_ids=jnp.zeros_like(ids) if "noring" in _parts else ids,
             run_starts=starts[:-1],
             run_lengths=starts[1:] - starts[:-1],
             run_length=1 if "noruns" in _parts else max_query_len,
         )
+        if "nocomp" in _parts:
+            pool = write_compressed(
+                pool,
+                completed,
+                complete,
+                req,
+                logical,
+                starts,
+                context,
+                compressed_table,
+                compress_ratio,
+                compressed_slot,
+            )
+        if "noring" in _parts:
+            pool = write_ring_and_tags(
+                pool, ring.reshape(len(ids), -1), tags.reshape(len(ids), -1), ids
+            )
     else:
         pool = write_compressed(
             pool,

@@ -35,6 +35,24 @@ _MAIN_READ, _COMP_READ, _MAIN_WRITE, _COMP_WRITE, _RING_WRITE = range(5)
 _RUN_READ, _RUN_WRITE = 5, 6
 
 
+class _SerialCopy:
+    """DEBUG: a DMA waited right after its start; the later wait is a no-op."""
+
+    def __init__(self, copy):
+        self.copy = copy
+
+    def start(self):
+        self.copy.start()
+        self.copy.wait()
+
+    def wait(self):
+        pass
+
+
+def _serial_dmas() -> bool:
+    return "serial" in os.environ.get("KVW_DBG_PARTS", "")
+
+
 def _per_dma_semaphores() -> bool:
     # DEBUG bisect knob (temporary): one DMA semaphore per row/request.
     return "persem" in os.environ.get("KVW_DBG_PARTS", "")
@@ -221,6 +239,9 @@ def fused_layer_write(
                 return sems.at[kind]
 
         def main_copy(i, read):
+            return _maybe_serial(_main_copy(i, read))
+
+        def _main_copy(i, read):
             stored = target_ref.at[page_ref[i], pl.ds(offset_ref[i], 1)]
             if read:
                 return pltpu.make_async_copy(
@@ -232,6 +253,9 @@ def fused_layer_write(
             )
 
         def run_copy(r, read):
+            return _maybe_serial(_run_copy(r, read))
+
+        def _run_copy(r, read):
             stored = target_ref.at[run_page_ref[r], pl.ds(run_off_ref[r], run_length)]
             if read:
                 return pltpu.make_async_copy(
@@ -247,6 +271,9 @@ def fused_layer_write(
             )
 
         def comp_copy(i, read):
+            return _maybe_serial(_comp_copy(i, read))
+
+        def _comp_copy(i, read):
             stored = target_ref.at[cpage_ref[i], coffset_ref[i], 0]
             staged_pair = comp_buf.at[i]
             source, dest = (stored, staged_pair) if read else (staged_pair, stored)
@@ -255,11 +282,19 @@ def fused_layer_write(
             )
 
         def ring_copy(lane):
+            return _maybe_serial(_ring_copy(lane))
+
+        def _ring_copy(lane):
             return pltpu.make_async_copy(
                 staged.at[lane],
                 target_ref.at[ids_ref[lane], pl.ds(0, state_tokens)],
                 sem(_RING_WRITE, lane),
             )
+
+        serial = _serial_dmas()
+
+        def _maybe_serial(copy):
+            return _SerialCopy(copy) if serial else copy
 
         def each(n, predicate, action):
             def body(i, carry):
