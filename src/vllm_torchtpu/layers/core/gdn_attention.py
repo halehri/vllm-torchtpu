@@ -865,8 +865,6 @@ def run_jax_gdn_attention_pooled_local(
     seq_lens: jnp.ndarray,
     read_offsets: jnp.ndarray | None = None,
     ckpt_indices: jnp.ndarray | None = None,
-    per_seq_rolled: jnp.ndarray | None = None,
-    per_seq_rolled_ckpt: jnp.ndarray | None = None,
     *,
     n_kq: int,
     n_v: int,
@@ -932,8 +930,6 @@ def run_jax_gdn_attention_pooled_local(
         state_plan=plan,
         num_spec_tokens=num_spec_tokens,
         conv_weight_kmajor=conv_weight_kmajor,
-        per_seq_rolled=per_seq_rolled,
-        per_seq_rolled_ckpt=per_seq_rolled_ckpt,
     )
     return recurrent_state, output
 
@@ -966,15 +962,9 @@ def run_jax_gdn_attention_pooled(
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
     read_offsets_per_seq: bool = False,
-    per_seq_rolled: jnp.ndarray | None = None,
-    per_seq_rolled_ckpt: jnp.ndarray | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
-    ``per_seq_rolled``: ``[query_start_loc | seq_lens | state_indices |
-    read_offsets]`` and ``per_seq_rolled_ckpt`` the checkpoint indices, rolled
-    once per step to start at the first prefill sequence; the per-sequence
-    metadata then skips its own rolls.
     ``read_offsets_per_seq``: ``slot_read_offsets`` is already indexed by
     ``state_indices`` (one offset per sequence), e.g. gathered once per step
     by the caller for every GDN layer, instead of the per-block buffer.
@@ -1049,18 +1039,6 @@ def run_jax_gdn_attention_pooled(
         )
         in_specs = in_specs + (P(None, None),)
 
-    if per_seq_rolled is not None:
-        # Positional after the optional read offsets / checkpoint indices,
-        # which ride as None when absent.
-        if slot_read_offsets is None:
-            in_specs = in_specs + (None,)
-        if ckpt_indices is None:
-            in_specs = in_specs + (None,)
-        in_specs = in_specs + (
-            P(None),
-            P(None, None) if per_seq_rolled_ckpt is not None else None,
-        )
-
     out_specs = (
         pool_spec,  # new_recurrent_state (attention-shaped pool)
         P(None, "model"),  # output
@@ -1109,12 +1087,6 @@ def run_jax_gdn_attention_pooled(
         # Already per-sequence (row s names sequence s's checkpoint blocks),
         # so it needs no gather by state_indices.
         extra_args = extra_args + (ckpt_indices,)
-    if per_seq_rolled is not None:
-        if slot_read_offsets is None:
-            extra_args = extra_args + (None,)
-        if ckpt_indices is None:
-            extra_args = extra_args + (None,)
-        extra_args = extra_args + (per_seq_rolled, per_seq_rolled_ckpt)
     outputs = mapped_fn(
         j_mixed_qkv,
         j_b,

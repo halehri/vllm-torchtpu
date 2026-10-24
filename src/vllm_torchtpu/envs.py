@@ -83,7 +83,6 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
     VLLM_TPU_GDN_HOIST_READ_OFFSETS: bool = False
     VLLM_TPU_QSA_BF16_REDUCE_PRECISION: bool = False
-    VLLM_TPU_GDN_HOIST_PER_SEQ_ROLLS: bool = False
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
@@ -480,11 +479,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fuses into neighbouring ops instead of running as its own fusion.
     "VLLM_TPU_QSA_BF16_REDUCE_PRECISION": env_bool(
         "VLLM_TPU_QSA_BF16_REDUCE_PRECISION", default=False
-    ),
-    # Pooled GDN: roll the per-sequence metadata inputs to the first prefill
-    # sequence in the step graph, once, instead of inside every layer's op.
-    "VLLM_TPU_GDN_HOIST_PER_SEQ_ROLLS": env_bool(
-        "VLLM_TPU_GDN_HOIST_PER_SEQ_ROLLS", default=False
     ),
     # Qwen4-exp QSA decode/verify attention: run the decode rows (and the
     # decode prefix of mixed steps) on the fused sparse GQA decode kernel
