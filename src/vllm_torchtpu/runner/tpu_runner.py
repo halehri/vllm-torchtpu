@@ -446,13 +446,13 @@ def _build_kv_connector_output(
     invalid_block_group_index: int | None,
     kv_connector_stats: Any | None = None,
 ) -> KVConnectorOutput:
-    """Build a connector output across the vLLM 0.23 API boundary.
+    """Build the runner's KVConnectorOutput.
 
-    vLLM 0.23 supports invalid block IDs only for a single KV cache group and
-    does not expose ``invalid_block_group_index``. Newer vLLM versions support
-    group-scoped recovery for hybrid caches. Do not pass the newer keyword to
-    0.23, but fail closed if a hybrid load actually fails: silently dropping
-    the group would make overlapping block IDs ambiguous to its scheduler.
+    ``failed_recving`` needs vLLM >= 0.31 (the pin is v0.32.0).
+    ``invalid_block_group_index`` is passed only when ``KVConnectorOutput``
+    has it. v0.32.0 does not, so it rejects block-level load failures on
+    multi-group KV layouts; connectors for those layouts must report failed
+    requests through ``failed_recving``.
     """
     kwargs: dict[str, Any] = {
         "finished_sending": finished_sending,

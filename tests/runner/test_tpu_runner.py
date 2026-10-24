@@ -991,7 +991,7 @@ def test_no_forward_output_preserves_invalid_block_ids():
         assert output.kv_connector_output.invalid_block_group_index == 2
 
 
-def test_build_kv_connector_output_supports_vllm_023():
+def test_build_kv_connector_output_omits_unsupported_group_index():
     with (
         patch.object(
             tpu_runner,

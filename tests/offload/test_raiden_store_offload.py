@@ -1505,6 +1505,17 @@ class TestWorkerSideConnector(unittest.TestCase):
         self.assertEqual(conn._completed_jobs, {3: 1, 4: 1})
         self.assertEqual(conn.get_block_ids_with_load_errors(), set())
 
+    def test_get_finished_refuses_to_report_a_failed_load(self):
+        # get_finished() has no failure channel: returning req-b as finished
+        # would pass its failed load as a good one.
+        conn = self._make_worker_connector()
+        conn._connector_metadata = self._meta(
+            finished_load_jobs={3: "req-a", 4: "req-b"},
+            failed_load_req_ids={"req-b"},
+        )
+        with self.assertRaisesRegex(RuntimeError, "get_transfer_results"):
+            conn.get_finished(set())
+
     def test_build_connector_worker_meta_drains_state(self):
         conn = self._make_worker_connector()
         self.assertIsNone(conn.build_connector_worker_meta())

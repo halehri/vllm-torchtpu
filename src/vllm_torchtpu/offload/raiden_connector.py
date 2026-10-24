@@ -492,9 +492,16 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         )
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
-        # Load failures only travel in get_transfer_results().failed_recving;
-        # the runner must call that, or a failed load passes as a good one.
+        # Load failures only travel in get_transfer_results().failed_recving.
+        # Returning a failed request here would pass its load as a good one,
+        # so refuse loudly; callers must use get_transfer_results().
         results = self.get_transfer_results(finished_req_ids)
+        if results.failed_recving:
+            raise RuntimeError(
+                "TPURaidenOffloadingConnector.get_finished() cannot report the "
+                f"failed loads of requests {sorted(results.failed_recving)}; "
+                "call get_transfer_results() instead"
+            )
         return results.finished_sending, results.finished_recving
 
     def get_transfer_results(
