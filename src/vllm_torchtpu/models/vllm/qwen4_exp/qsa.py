@@ -688,8 +688,10 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         # With VLLM_TPU_QSA_INDEXER_SHARD too: the sharded indexer's candidates
         # are merged first, then the same group attention.
         op = self._shard_group_op or self._group_op
+        # The op projects the queries itself, only for the rows that attend
+        # with them, from the hidden states and the group's q_proj rows.
         return op(
-            self.q12_proj(hidden),
+            hidden,
             self.k_proj(hidden),
             self.v_proj(hidden),
             self.indexer.index_qk_proj(hidden),
@@ -706,6 +708,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             metadata.main_block_table,
             metadata.compressed_block_table,
             self.group_index,
+            self.q12_proj.weight,
             self.o12,
             **(
                 {"k_scale": self._k_scale_float, "v_scale": self._v_scale_float}

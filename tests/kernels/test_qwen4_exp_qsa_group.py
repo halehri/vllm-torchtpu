@@ -12,6 +12,14 @@ from test_qwen4_exp_paired_pages import pack_rows
 from vllm_torchtpu.kernels.qwen4_exp import qsa_group, qsa_rpa
 
 GROUP, HEADS, DIM, HIDDEN, RATIO = 4, 3, 256, 128, 4
+EPS, ROTARY = 1e-6, 64
+
+
+def _trig():
+    angle = jnp.arange(4096)[:, None] * jnp.arange(ROTARY // 2)[None, :] / 8192
+    return jnp.pad(
+        jnp.concatenate([jnp.cos(angle), jnp.sin(angle)], 1), ((0, 0), (0, 64))
+    ).astype(jnp.bfloat16)
 
 
 @pytest.fixture
@@ -57,14 +65,19 @@ def _step(rng, tokens, starts, contexts, page_size=128):
     cache = pack_rows(key, value, fp8=True, k_scale=0.375, v_scale=2.5).reshape(
         pages, page_size, 1, 4, DIM
     )
-    q12 = jnp.asarray(rng.normal(0, 0.3, (tokens, GROUP * HEADS, DIM)), jnp.bfloat16)
-    gate12 = jnp.asarray(rng.uniform(-3, 3, q12.shape), jnp.bfloat16)
+    hidden = jnp.asarray(rng.normal(0, 1.0, (tokens, HIDDEN)), jnp.bfloat16)
+    q12_w = jnp.asarray(
+        rng.normal(0, 0.1, (GROUP * HEADS * 2 * DIM, HIDDEN)), jnp.bfloat16
+    )
     o12 = jnp.asarray(
         rng.normal(0, 0.05, (GROUP * HEADS * DIM, HIDDEN)), jnp.bfloat16
     )
     return dict(
-        q12=q12,
-        gate12=gate12,
+        hidden=hidden,
+        q12_w=q12_w,
+        nq=jnp.asarray(rng.normal(0, 0.1, (DIM,)), jnp.bfloat16),
+        positions=jnp.asarray(np.maximum(lengths - 1, 0), jnp.int32),
+        trig=_trig(),
         blocks=jnp.asarray(blocks),
         lengths=jnp.asarray(lengths),
         table=jnp.asarray(table),
@@ -76,8 +89,11 @@ def _step(rng, tokens, starts, contexts, page_size=128):
 
 def _run(inp, s, **kw):
     out, _ = qsa_group.group_attention(
-        inp["q12"],
-        inp["gate12"],
+        inp["hidden"],
+        inp["q12_w"],
+        inp["nq"],
+        inp["positions"],
+        inp["trig"],
         inp["blocks"],
         inp["lengths"],
         inp["table"],
@@ -86,6 +102,8 @@ def _run(inp, s, **kw):
         jnp.asarray([s], jnp.int32),
         inp["o12"],
         ratio=RATIO,
+        norm_eps=EPS,
+        rotary_dim=ROTARY,
         k_scale=0.375,
         v_scale=2.5,
         max_query_len=4,
@@ -121,8 +139,10 @@ def test_below_threshold_is_the_per_rank_path(interpret, tokens):
     inp = _step(rng, tokens, starts, contexts)
     for s in range(GROUP):
         got = _run(inp, s)  # default min_tokens=1024
-        q3 = qsa_group.rank_heads(inp["q12"], jnp.asarray([s]), HEADS)
-        gate3 = qsa_group.rank_heads(inp["gate12"], jnp.asarray([s]), HEADS)
+        q3_w = qsa_group.rank_columns(inp["q12_w"], jnp.asarray([s]), HEADS * 2 * DIM)
+        q3, gate3 = qsa_group.project_query(
+            inp["hidden"], q3_w, inp["nq"], inp["positions"], inp["trig"], EPS, ROTARY
+        )
         attn, _ = qsa_rpa.qsa_attention(
             q3, gate3, inp["blocks"], inp["lengths"], inp["table"], inp["cache"],
             inp["starts"], kv_heads=1, ratio=RATIO, k_scale=0.375, v_scale=2.5,

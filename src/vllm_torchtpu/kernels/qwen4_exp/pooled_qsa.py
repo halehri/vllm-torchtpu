@@ -1095,9 +1095,10 @@ def _pooled_qsa(
 ) -> tuple[jax.Array, ...]:
     """One QSA layer over the unified pool.
 
-    ``group``: ``(group_index, o12, min_tokens)`` for the KV-group split
-    (``qsa_group.group_attention``); ``qgate`` then holds the group's 12
-    heads and the output is this rank's ``[T, hidden]`` projected partial.
+    ``group``: the KV-group split's operands (``_group_operands``); the
+    queries are then projected inside ``qsa_group.group_attention`` from
+    ``group["hidden"]`` (``qgate`` only feeds the shared producer) and the
+    output is this rank's ``[T, hidden]`` projected partial.
 
     ``select_only``: stop after the indexer and return ``(pool, q, gate, pages,
     kv_lens)`` for an attention computed elsewhere (the Qwen3.8 segment
@@ -1316,8 +1317,6 @@ def _pooled_qsa(
         assert rows is None, "the group split covers all-token steps"
         return _group_attend(
             pool,
-            q,
-            gate,
             blocks,
             lengths,
             main_table[req],
@@ -1350,10 +1349,32 @@ def _pooled_qsa(
     )
 
 
+def _group_operands(
+    hidden, q12_w, nq, positions, trig, group_index, o12, norm_eps, rotary_dim, min_tokens
+):
+    """The KV-group split's operands, as ``_group_attend`` takes them."""
+    return dict(
+        hidden=hidden,
+        q12_w=q12_w,
+        nq=nq,
+        positions=positions,
+        trig=trig,
+        group_index=group_index,
+        o12=o12,
+        norm_eps=norm_eps,
+        rotary_dim=rotary_dim,
+        min_tokens=min_tokens,
+    )
+
+
+def _query_stub(hidden, nq):
+    """A one-head ``qgate`` for the shared producer: the split projects its
+    own queries (``qsa_group.project_query``), only for the rows using them."""
+    return jnp.zeros((len(hidden), 2 * nq.shape[0]), jnp.bfloat16)
+
+
 def _group_attend(
     pool,
-    q,
-    gate,
     blocks,
     lengths,
     table,
@@ -1368,26 +1389,30 @@ def _group_attend(
     max_query_len,
 ):
     """``_attend`` under the KV-group split: ``(pool, partial [T, hidden],
-    selected)``, ``group`` = ``(group_index, o12, min_tokens)``."""
+    selected)``; ``group`` from ``_group_operands``."""
     from vllm_torchtpu.kernels.qwen4_exp.qsa_group import group_attention
 
-    group_index, o12, min_tokens = group
     partial, pool = group_attention(
-        q,
-        gate,
+        group["hidden"],
+        group["q12_w"],
+        group["nq"],
+        group["positions"],
+        group["trig"],
         blocks,
         lengths,
         table,
         pool,
         starts,
-        group_index,
-        o12,
+        group["group_index"],
+        group["o12"],
         ratio=compress_ratio,
+        norm_eps=group["norm_eps"],
+        rotary_dim=group["rotary_dim"],
         k_scale=k_scale,
         v_scale=v_scale,
         kv_head_offset=main_slot if main_slot > 0 else 0,
         max_query_len=max_query_len,
-        min_tokens=min_tokens,
+        min_tokens=group["min_tokens"],
     )
     return pool, partial, selected_tokens(blocks, lengths, token_topk, compress_ratio)
 
@@ -1603,9 +1628,9 @@ def _shard_attend(
 ):
     """Merge the gathered candidates, attend, and pick ``rows`` if given.
 
-    ``group`` (``(group_index, o12, min_tokens)``): finish through the
-    KV-group split (``_group_attend``) on the merged global blocks; ``q`` /
-    ``gate`` then hold the group's 12 heads.
+    ``group`` (``_group_operands``): finish through the KV-group split
+    (``_group_attend``) on the merged global blocks; ``q`` / ``gate`` are
+    then unused (the split projects its own queries).
 
     ``gathered`` is ``[ranks, tokens, k, 2]`` candidates, or ``[tokens, k]``
     already merged blocks when ``merged``. ``k_scale``/``v_scale`` are the
@@ -1629,8 +1654,6 @@ def _shard_attend(
         assert rows is None, "the group split covers all-token steps"
         return _group_attend(
             pool,
-            q,
-            gate,
             blocks,
             lengths,
             main_table[req],
@@ -1719,11 +1742,18 @@ def pooled_qsa_shard_group_attend_step(
     context: jax.Array,
     pool: jax.Array,
     gathered: jax.Array,
+    hidden: jax.Array,
+    q12_w: jax.Array,
+    nq: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
     group_index: jax.Array,
     o12: jax.Array,
     kv_heads: int,
     compress_ratio: int,
     token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     main_slot: int = -1,
@@ -1732,7 +1762,9 @@ def pooled_qsa_shard_group_attend_step(
     min_tokens: int = 1024,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """``pooled_qsa_shard_attend_step`` under the KV-group split: merge, then
-    the group attention; returns ``(pool, partial [T, hidden], selected)``."""
+    the group attention, which projects its own queries from ``hidden``
+    (``q`` / ``gate`` from the select step are unused); returns
+    ``(pool, partial [T, hidden], selected)``."""
     return _shard_attend(
         q,
         gate,
@@ -1752,7 +1784,10 @@ def pooled_qsa_shard_group_attend_step(
         main_slot=main_slot,
         max_query_len=max_query_len,
         merged=merged,
-        group=(group_index, o12, min_tokens),
+        group=_group_operands(
+            hidden, q12_w, nq, positions, trig, group_index, o12,
+            norm_eps, rotary_dim, min_tokens,
+        ),
     )
 
 
@@ -1972,7 +2007,7 @@ def pooled_qsa_select_step(
 
 
 def pooled_qsa_group_step(
-    qgate: jax.Array,
+    hidden: jax.Array,
     key: jax.Array,
     value: jax.Array,
     index_qk: jax.Array,
@@ -1989,6 +2024,7 @@ def pooled_qsa_group_step(
     main_table: jax.Array,
     compressed_table: jax.Array,
     group_index: jax.Array,
+    q12_w: jax.Array,
     o12: jax.Array,
     compress_ratio: int,
     token_topk: int,
@@ -2003,14 +2039,15 @@ def pooled_qsa_group_step(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """``pooled_qsa_step`` under the KV-group split (VLLM_TPU_QSA_GROUP_SPLIT).
 
-    ``qgate`` holds the rank's KV-group's 12 query heads, ``o12`` the group's
-    ``o_proj`` ``[12 * D, hidden]`` and ``group_index`` (int32 ``[1]``) the
-    rank's index in its group. Writes and the indexer are those of
+    ``hidden`` is the layer's attention input, ``q12_w`` the rank's KV
+    group's ``q_proj`` rows (``[12 * 2D, H]``), ``o12`` its ``o_proj``
+    ``[12 * D, hidden]`` and ``group_index`` (int32 ``[1]``) the rank's index
+    in its group. Writes and the indexer are those of
     ``pooled_qsa_step``; returns ``(pool, partial [T, hidden], selected)``,
     the partial to be all-reduced over TP.
     """
     return _pooled_qsa(
-        qgate,
+        _query_stub(hidden, nq),
         key,
         value,
         index_qk,
@@ -2035,7 +2072,10 @@ def pooled_qsa_group_step(
         compressed_slot,
         main_slot,
         max_query_len=max_query_len,
-        group=(group_index, o12, min_tokens),
+        group=_group_operands(
+            hidden, q12_w, nq, positions, trig, group_index, o12,
+            norm_eps, rotary_dim, min_tokens,
+        ),
     )
 
 
