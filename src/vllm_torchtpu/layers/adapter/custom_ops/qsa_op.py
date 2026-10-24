@@ -173,6 +173,66 @@ def build_pooled_qsa_op():
 
 
 @functools.cache
+def build_pooled_qsa_group_op():
+    """``build_pooled_qsa_op`` under the KV-group split: ``(partial, blocks)``
+    with ``partial`` this rank's projected ``[T, hidden]`` output."""
+    from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import pooled_qsa_group_step
+
+    op = pallas.jax_op(
+        "qwen4_exp::pooled_qsa_group", pooled_qsa_group_step, donate_argnums=(10,)
+    )
+
+    @op.register_fake
+    def fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        group_index,
+        o12,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale=1.0,
+        v_scale=1.0,
+        compressed_slot=0,
+        main_slot=-1,
+        max_query_len=1,
+        min_tokens=1024,
+    ):
+        return (
+            torch.empty_like(pool),
+            qgate.new_empty((qgate.shape[0], o12.shape[1])),
+            positions.new_empty(
+                (qgate.shape[0], token_topk + compress_ratio - 1), dtype=torch.int32
+            ),
+        )
+
+    def run(*args, **kwargs):
+        args = list(args)
+        for index in (8, 11, 12, 13, 14, 15, 16):
+            args[index] = args[index].to(torch.int32)
+        updated, output, blocks = op(*args, **kwargs)
+        args[10].copy_(updated)
+        return output, blocks
+
+    return run
+
+
+@functools.cache
 def build_pooled_qsa_select_op() -> Callable[..., tuple[torch.Tensor, ...]]:
     """``build_pooled_qsa_op`` up to the indexer, for an attention computed in the
     Qwen3.8 segment megakernel: returns ``(q, gate, pages, kv_lens)``."""

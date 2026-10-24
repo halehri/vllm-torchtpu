@@ -88,6 +88,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
     VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK: int = 256
     VLLM_TPU_QSA_RING_SELECT: bool = False
+    VLLM_TPU_QSA_GROUP_SPLIT: bool = False
+    VLLM_TPU_QSA_GROUP_SPLIT_MIN_TOKENS: int = 1024
     VLLM_TPU_QSA_RING_DMA_BATCH: int = 0
     VLLM_TPU_GDN_HOIST_READ_OFFSETS: bool = False
     VLLM_TPU_QSA_BF16_REDUCE_PRECISION: bool = False
@@ -510,6 +512,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Qwen4-exp pooled QSA: request row r owns ring row r, so the indexer
     # update's whole-row ring/tag gathers and final scatter become selects.
     "VLLM_TPU_QSA_RING_SELECT": env_bool("VLLM_TPU_QSA_RING_SELECT", default=False),
+    # Qwen4-exp QSA KV-group split (kernels/qwen4_exp/qsa_group.py): at TP8,
+    # the 4 ranks of a KV group each attend one quarter of a step's prefill
+    # rows with the group's 12 query heads instead of all rows with 3, for
+    # steps of at least VLLM_TPU_QSA_GROUP_SPLIT_MIN_TOKENS tokens.
+    "VLLM_TPU_QSA_GROUP_SPLIT": env_bool("VLLM_TPU_QSA_GROUP_SPLIT", default=False),
+    "VLLM_TPU_QSA_GROUP_SPLIT_MIN_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_QSA_GROUP_SPLIT_MIN_TOKENS", 1024
+    ),
     # Qwen4-exp QSA ring/tag state I/O: concurrent row DMAs per tile. 0 uses
     # the measured table (pool pages without an entry, e.g. 512-token FP8
     # pages, fall back to one serial DMA per request); N > 0 uses the largest
