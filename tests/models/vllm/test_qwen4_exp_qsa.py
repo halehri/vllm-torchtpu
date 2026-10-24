@@ -431,6 +431,10 @@ def test_group_split_loads_the_group_heads(rank, monkeypatch):
         torch.testing.assert_close(o12[s * 768 : (s + 1) * 768].t(), module.o_proj.weight.float())
         assert module.group_index.tolist() == [s]
         assert module.group_index.dtype == torch.int32
+        assert module.group_split_active
+        # The MTP draft (one graph for every token bucket) never splits.
+        module.single_graph = True
+        assert not module.group_split_active
 
 
 @pytest.mark.parametrize("tp,pooled", [(4, True), (8, False)])

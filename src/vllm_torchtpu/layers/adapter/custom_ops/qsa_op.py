@@ -643,7 +643,9 @@ def _shard_group_attend_op():
     return attend
 
 
-def build_pooled_qsa_shard_op(tp_group, a2a_min_tokens: int = 0, group: bool = False):
+def build_pooled_qsa_shard_op(
+    tp_group, a2a_min_tokens: int = 0, kv_group_split: bool = False
+):
     """``build_pooled_qsa_op`` with the indexer split across ``tp_group``.
 
     Each rank scores an interleaved 1/TP of every request's compressed keys
@@ -657,7 +659,7 @@ def build_pooled_qsa_shard_op(tp_group, a2a_min_tokens: int = 0, group: bool = F
     trailing ``rows`` operand (as ``build_pooled_qsa_rows_op``) and a
     ``kv_heads`` keyword.
 
-    ``group`` (VLLM_TPU_QSA_GROUP_SPLIT): operand 0 is the layer's hidden
+    ``kv_group_split`` (VLLM_TPU_QSA_GROUP_SPLIT): operand 0 is the layer's hidden
     states instead of ``qgate``, the operands end with ``group_index``,
     ``q12_w`` and ``o12`` instead of ``rows``, a ``min_tokens`` keyword is
     taken, and the output is this rank's projected ``[T, hidden]`` partial
@@ -669,12 +671,12 @@ def build_pooled_qsa_shard_op(tp_group, a2a_min_tokens: int = 0, group: bool = F
     # step function's signature, which Dynamo cannot trace inside forward.
     shard_ops = {with_rows: _shard_ops(with_rows) for with_rows in (False, True)}
     merge_op = _merge_op()
-    group_attend = _shard_group_attend_op() if group else None
+    group_attend = _shard_group_attend_op() if kv_group_split else None
 
     def run(*args, kv_heads, **kwargs):
         args = list(args)
         group_args = []
-        if group:
+        if kv_group_split:
             # Operands end with group_index, q12_w, o12; the split projects
             # its own queries from the hidden states (operand 0), so the
             # select step gets a one-head query stub.
@@ -697,7 +699,7 @@ def build_pooled_qsa_shard_op(tp_group, a2a_min_tokens: int = 0, group: bool = F
                 args[index] = args[index].to(torch.int32)
         with_rows = len(args) == 17
         select, attend = shard_ops[with_rows]
-        if group:
+        if kv_group_split:
             attend = group_attend
         pool = args[10]
         updated, q, gate, lengths, req, starts, candidates = select(
@@ -713,7 +715,7 @@ def build_pooled_qsa_shard_op(tp_group, a2a_min_tokens: int = 0, group: bool = F
             for name in ("k_scale", "v_scale", "main_slot", "max_query_len")
             if name in kwargs
         }
-        if group:
+        if kv_group_split:
             attend_kwargs.update(
                 min_tokens=min_tokens,
                 norm_eps=kwargs["norm_eps"],
