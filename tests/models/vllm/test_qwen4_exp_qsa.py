@@ -380,3 +380,73 @@ def test_checkpoint_head_packing_and_kv_replication(tp, rank, monkeypatch):
         assert module.get_auxiliary_cache_specs()["compressed_k"].tokens_per_state == 4
         with pytest.raises(ValueError, match="Missing"):
             module.finalize_weights()
+
+
+@pytest.mark.parametrize("rank", [0, 3, 4, 6])
+def test_group_split_loads_the_group_heads(rank, monkeypatch):
+    """VLLM_TPU_QSA_GROUP_SPLIT: q12_proj / o12 hold the rank's KV group's 12
+    heads, in rank order, and the rank's own q_proj / o_proj slices are the
+    group-index-th 3 of them (what the per-rank path slices at run time)."""
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_GROUP_SPLIT", True, raising=False)
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: rank
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: 8
+    )
+    with torch.device("cpu"):
+        module = Qwen4ExpQSA(
+            config=attention_config(),
+            tp_size=8,
+            tp_rank=rank,
+            max_model_len=8192,
+            pooled=True,
+        )
+        assert module.group_split
+        # Compare against what the checkpoint holds: BF16-rounded values.
+        q = torch.arange(12288, dtype=torch.float32)[:, None].expand(-1, 2560)
+        k = torch.arange(512, dtype=torch.float32)[:, None].expand(-1, 2560)
+        index = torch.arange(640, dtype=torch.float32)[:, None].expand(-1, 2560)
+        o = torch.arange(6144, dtype=torch.float32)[None].expand(2560, -1)
+        q, k, index, o = (x.to(torch.bfloat16).float() for x in (q, k, index, o))
+        loaded = module.load_weights(
+            [
+                ("q_proj.weight", q.to(torch.bfloat16)),
+                ("k_proj.weight", k.to(torch.bfloat16)),
+                ("v_proj.weight", k.to(torch.bfloat16)),
+                ("indexer.index_qk_proj.weight", index.to(torch.bfloat16)),
+                ("o_proj.weight", o.to(torch.bfloat16)),
+            ]
+        )
+        assert "q12_proj.weight" in loaded
+        group, s = rank // 4, rank % 4
+        q12 = module.q12_proj.weight.float()
+        torch.testing.assert_close(q12, q[group * 6144 : (group + 1) * 6144])
+        torch.testing.assert_close(q12[s * 1536 : (s + 1) * 1536], module.q_proj.weight.float())
+        o12 = module.o12.float()
+        assert tuple(o12.shape) == (3072, 2560)
+        torch.testing.assert_close(o12, o[:, group * 3072 : (group + 1) * 3072].t())
+        torch.testing.assert_close(o12[s * 768 : (s + 1) * 768].t(), module.o_proj.weight.float())
+        assert module.group_index.tolist() == [s]
+        assert module.group_index.dtype == torch.int32
+
+
+@pytest.mark.parametrize("tp,pooled", [(4, True), (8, False)])
+def test_group_split_needs_groups_of_four(tp, pooled, monkeypatch):
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_GROUP_SPLIT", True, raising=False)
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 1
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: tp
+    )
+    with torch.device("cpu"):
+        module = Qwen4ExpQSA(
+            config=attention_config(), tp_size=tp, tp_rank=1, max_model_len=8192,
+            pooled=pooled,
+        )
+    assert not module.group_split and not hasattr(module, "q12_proj")

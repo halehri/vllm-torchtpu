@@ -1091,8 +1091,13 @@ def _pooled_qsa(
     rows: jax.Array | None = None,
     select_only: bool = False,
     shard: tuple[int, int] | None = None,
+    group: tuple | None = None,
 ) -> tuple[jax.Array, ...]:
     """One QSA layer over the unified pool.
+
+    ``group``: ``(group_index, o12, min_tokens)`` for the KV-group split
+    (``qsa_group.group_attention``); ``qgate`` then holds the group's 12
+    heads and the output is this rank's ``[T, hidden]`` projected partial.
 
     ``select_only``: stop after the indexer and return ``(pool, q, gate, pages,
     kv_lens)`` for an attention computed elsewhere (the Qwen3.8 segment
@@ -1307,6 +1312,24 @@ def _pooled_qsa(
             pages.astype(jnp.int32),
             kv_lens.astype(jnp.int32),
         )
+    if group is not None:
+        assert rows is None, "the group split covers all-token steps"
+        return _group_attend(
+            pool,
+            q,
+            gate,
+            blocks,
+            lengths,
+            main_table[req],
+            starts,
+            group,
+            compress_ratio=compress_ratio,
+            token_topk=token_topk,
+            k_scale=k_scale if fp8 else 1.0,
+            v_scale=v_scale if fp8 else 1.0,
+            main_slot=main_slot,
+            max_query_len=max_query_len,
+        )
     return _attend(
         pool,
         q,
@@ -1325,6 +1348,48 @@ def _pooled_qsa(
         main_slot=main_slot,
         max_query_len=max_query_len,
     )
+
+
+def _group_attend(
+    pool,
+    q,
+    gate,
+    blocks,
+    lengths,
+    table,
+    starts,
+    group,
+    *,
+    compress_ratio,
+    token_topk,
+    k_scale,
+    v_scale,
+    main_slot,
+    max_query_len,
+):
+    """``_attend`` under the KV-group split: ``(pool, partial [T, hidden],
+    selected)``, ``group`` = ``(group_index, o12, min_tokens)``."""
+    from vllm_torchtpu.kernels.qwen4_exp.qsa_group import group_attention
+
+    group_index, o12, min_tokens = group
+    partial, pool = group_attention(
+        q,
+        gate,
+        blocks,
+        lengths,
+        table,
+        pool,
+        starts,
+        group_index,
+        o12,
+        ratio=compress_ratio,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        kv_head_offset=main_slot if main_slot > 0 else 0,
+        max_query_len=max_query_len,
+        min_tokens=min_tokens,
+    )
+    return pool, partial, selected_tokens(blocks, lengths, token_topk, compress_ratio)
 
 
 def _attend(
@@ -1833,6 +1898,74 @@ def pooled_qsa_select_step(
         main_slot,
         max_query_len=max_query_len,
         select_only=True,
+    )
+
+
+def pooled_qsa_group_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    group_index: jax.Array,
+    o12: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    min_tokens: int = 1024,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_step`` under the KV-group split (VLLM_TPU_QSA_GROUP_SPLIT).
+
+    ``qgate`` holds the rank's KV-group's 12 query heads, ``o12`` the group's
+    ``o_proj`` ``[12 * D, hidden]`` and ``group_index`` (int32 ``[1]``) the
+    rank's index in its group. Writes and the indexer are those of
+    ``pooled_qsa_step``; returns ``(pool, partial [T, hidden], selected)``,
+    the partial to be all-reduced over TP.
+    """
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        group=(group_index, o12, min_tokens),
     )
 
 

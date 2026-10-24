@@ -30,6 +30,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm_torchtpu import envs
 from vllm_torchtpu import envs as vllm_torchtpu_envs
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+from vllm_torchtpu.kernels.qwen4_exp.qsa_group import GROUP
 from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import build_qsa_op
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
@@ -287,6 +288,20 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self.single_graph = False
         kv_size = min(tp_size, self.total_num_kv_heads)
         kv_rank = tp_rank // max(tp_size // self.total_num_kv_heads, 1)
+        # VLLM_TPU_QSA_GROUP_SPLIT (kernels/qwen4_exp/qsa_group.py): the ranks
+        # sharing a KV head each attend a quarter of a step's prefill rows with
+        # the group's 12 query heads. Needs groups of 4 ranks (TP8, 2 KV heads)
+        # and the unified pool. q_proj / o_proj stay as they are (the
+        # megakernel and the MTP tail read them); the group's q12_proj and o12
+        # are separate, loaded from the same checkpoint tensors.
+        self.group_split = bool(
+            vllm_torchtpu_envs.VLLM_TPU_QSA_GROUP_SPLIT
+            and pooled
+            and tp_size // max(self.total_num_kv_heads, 1) == GROUP
+            and self.total_num_kv_heads * GROUP == tp_size
+        )
+        self._group_rank = tp_rank % GROUP
+        self._group_op = None
         with torch.device(device or "cpu"), set_default_torch_dtype(torch.bfloat16):
             self.q_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -328,6 +343,33 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 return_bias=False,
                 disable_tp=True,
             )
+            if self.group_split:
+                self.q12_proj = ColumnParallelLinear(
+                    self.hidden_size,
+                    2 * self.total_num_heads * self.head_dim,
+                    bias=False,
+                    params_dtype=torch.bfloat16,
+                    quant_config=None,
+                    prefix=prefix + ".q12_proj",
+                    return_bias=False,
+                    tp_rank=kv_rank,
+                    tp_size=kv_size,
+                )
+                # Input-major [12 * D, hidden], as the attention stage takes it.
+                self.register_buffer(
+                    "o12",
+                    torch.empty(
+                        GROUP * self.num_heads * self.head_dim,
+                        self.hidden_size,
+                        dtype=torch.bfloat16,
+                    ),
+                    persistent=False,
+                )
+                self.register_buffer(
+                    "group_index",
+                    torch.full((1,), self._group_rank, dtype=torch.int32),
+                    persistent=False,
+                )
             self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
             self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
             self.indexer = _Indexer(config, prefix + ".indexer")
@@ -395,6 +437,16 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             keywords["main_slot"] = main_slot
         self._op = partial(build_pooled_qsa_op(), **keywords)
         self._rows_op = partial(build_pooled_qsa_rows_op(), **keywords)
+        if self.group_split:
+            from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
+                build_pooled_qsa_group_op,
+            )
+
+            self._group_op = partial(
+                build_pooled_qsa_group_op(),
+                **keywords,
+                min_tokens=vllm_torchtpu_envs.VLLM_TPU_QSA_GROUP_SPLIT_MIN_TOKENS,
+            )
         # The select op (`select_for_kernel`) is built here, outside the traced
         # forward (jax_op inspects the step signature, which Dynamo cannot trace),
         # and only when the megakernel is enabled: default serving never
@@ -551,8 +603,15 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             with torch.no_grad():
                 if name in ("q_proj.weight", "k_proj.weight", "v_proj.weight"):
                     cast(BasevLLMParameter, parameter).weight_loader(parameter, weight)
+                    if name == "q_proj.weight" and self.group_split:
+                        q12 = self.q12_proj.weight
+                        cast(BasevLLMParameter, q12).weight_loader(q12, weight)
+                        loaded.add("q12_proj.weight")
                 elif name == "o_proj.weight":
                     width = self.num_heads * self.head_dim
+                    if self.group_split:
+                        group, span = self.tp_rank // GROUP, GROUP * width
+                        self.o12.copy_(weight[:, group * span : (group + 1) * span].t())
                     self.o_proj.weight_loader(
                         parameter,
                         weight[:, self.tp_rank * width : (self.tp_rank + 1) * width],
@@ -580,11 +639,64 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         caches are still written for every token. Pooled QSA attends only
         the rows; the dedicated-cache path attends all tokens and picks.
         """
-        output, selected = self.attend_with_indices(hidden, positions, metadata, rows)
-        output = self.o_proj(output)
+        if self.group_split and rows is None:
+            # Already this rank's o_proj partial (VLLM_TPU_QSA_GROUP_SPLIT).
+            output, selected = self._group_attend(hidden, positions, metadata)
+        else:
+            output, selected = self.attend_with_indices(
+                hidden, positions, metadata, rows
+            )
+            output = self.o_proj(output)
         if reduce and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output)
         return output, selected
+
+    def _pooled_metadata(self, metadata: QSAMetadata) -> QSAMetadata:
+        per_layer = cast(
+            dict[str, AttentionMetadata], get_forward_context().attn_metadata
+        )
+        return replace(
+            metadata,
+            state_slots=cast(
+                torch.Tensor, per_layer[self.prefix + ".raw_ring"].block_tables
+            ),
+            main_block_table=cast(
+                torch.Tensor, per_layer[self.main_cache_name].block_tables
+            ),
+            compressed_block_table=cast(
+                torch.Tensor, per_layer[self.compressed_cache_name].block_tables
+            ),
+        )
+
+    def _group_attend(self, hidden, positions, metadata: QSAMetadata):
+        """``(o_proj partial [T, hidden], selected)`` under the KV-group split."""
+        assert self._group_op is not None and len(self.cache_owners) == 1
+        metadata = self._pooled_metadata(metadata)
+        return self._group_op(
+            self.q12_proj(hidden),
+            self.k_proj(hidden),
+            self.v_proj(hidden),
+            self.indexer.index_qk_proj(hidden),
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.indexer.q_layernorm.weight,
+            self.indexer.k_layernorm.weight,
+            positions,
+            self.rope_cache,
+            *self.cache_owners,
+            metadata.query_start_loc,
+            metadata.context_lens,
+            metadata.state_slots,
+            metadata.main_block_table,
+            metadata.compressed_block_table,
+            self.group_index,
+            self.o12,
+            **(
+                {"k_scale": self._k_scale_float, "v_scale": self._v_scale_float}
+                if self.fp8_kv
+                else {}
+            ),
+        )
 
     def attend(self, hidden, positions, metadata: QSAMetadata):
         """Gated attention output before ``o_proj`` (this rank's heads)."""
