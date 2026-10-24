@@ -206,6 +206,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
     VLLM_TPU_SEGMENT_TOKENIZE_VERIFY: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
+    VLLM_TPU_PREFILL_STEP_CAP: int = 0
     VLLM_TPU_FUSED_ASYNC_DRAFT_SEED: bool = True
     VLLM_TPU_DEFER_PREV_RESULTS_WAIT: bool = False
     VLLM_TPU_LOG_POST_WARMUP_COMPILES: bool = False
@@ -1297,6 +1298,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DEFER_PREV_RESULTS_WAIT": env_bool(
         "VLLM_TPU_DEFER_PREV_RESULTS_WAIT", default=False
     ),
+    # PrefixAwareScheduler: cap a step's prefill tokens at this value while any
+    # decode is running (decodes then advance on every shorter step). 0 = off.
+    "VLLM_TPU_PREFILL_STEP_CAP": env_int("VLLM_TPU_PREFILL_STEP_CAP", 0),
     # Async spec decode: derive the draft seed (token, position, rejected
     # count) from the rejection-sampler output in one compiled program per
     # request-padding bucket instead of ~15 eager ones (eagle3.py

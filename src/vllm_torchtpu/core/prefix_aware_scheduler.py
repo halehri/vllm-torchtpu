@@ -40,6 +40,8 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.request import Request
 
+from vllm_torchtpu import envs
+
 logger = init_logger("vllm." + __name__)
 
 _LOG_EVERY = 1000
@@ -107,7 +109,50 @@ class PrefixAwareScheduler(AsyncScheduler):
         )
         if queue is not None:
             self._promote_warmest(queue)
+        cap = envs.VLLM_TPU_PREFILL_STEP_CAP
+        if cap > 0:
+            return self._schedule_with_prefill_cap(throttle_prefills, cap)
         return super().schedule(throttle_prefills)
+
+    def _schedule_with_prefill_cap(self, throttle_prefills: bool, cap: int):
+        """Cap a step's prefill tokens at `cap` while any decode is running
+        (VLLM_TPU_PREFILL_STEP_CAP).
+
+        A full prefill chunk makes every running decode wait out its whole
+        forward; capped, the same prefill runs over more, shorter steps and
+        the decodes advance on each of them. The step budget becomes `cap`
+        plus the running decodes' tokens, decodes are scheduled first so
+        they always fit, and each request's chunk is capped at `cap`, so
+        the prefill still progresses every step. Without a running decode
+        the full budget applies.
+        """
+        decodes = sum(1 for r in self.running if not r.is_prefill_chunk)
+        if decodes == 0:
+            return super().schedule(throttle_prefills)
+        spec = self.vllm_config.speculative_config
+        per_decode = 1 + (spec.num_speculative_tokens if spec is not None else 0)
+        budget = cap + decodes * per_decode
+        if budget >= self.max_num_scheduled_tokens:
+            return super().schedule(throttle_prefills)
+        # Decodes first (stable), so the prefill chunks take what is left.
+        self.running.sort(key=lambda r: r.is_prefill_chunk)
+        sched_config = self.scheduler_config
+        saved = (
+            self.max_num_scheduled_tokens,
+            sched_config.long_prefill_token_threshold,
+            getattr(self, "adaptive_long_prefill_threshold", False),
+        )
+        self.max_num_scheduled_tokens = budget
+        sched_config.long_prefill_token_threshold = cap
+        self.adaptive_long_prefill_threshold = False
+        try:
+            return super().schedule(throttle_prefills)
+        finally:
+            (
+                self.max_num_scheduled_tokens,
+                sched_config.long_prefill_token_threshold,
+                self.adaptive_long_prefill_threshold,
+            ) = saved
 
     def _promote_warmest(self, queue: RequestQueue) -> None:
         """Promote the request with the fewest uncached tokens within WINDOW."""

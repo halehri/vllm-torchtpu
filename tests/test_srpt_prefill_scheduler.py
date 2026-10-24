@@ -517,3 +517,37 @@ def test_max_consecutive_holds_env_var_and_compile_cache(
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS"
         not in tpu_compiler._tpu_compile_env_factors()
     )
+
+
+def test_prefill_step_cap_applies_only_while_decoding(shared_model_config, monkeypatch):
+    monkeypatch.setenv("VLLM_TPU_PREFILL_STEP_CAP", "16")
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        scheduler_cls=PrefixAwareScheduler,
+        max_num_batched_tokens=64,
+    )
+    # No decode running: a lone prefill takes the full budget.
+    scheduler.add_request(_make_real_request("dec", 8, hasher, seed=3))
+    assert scheduler.schedule().num_scheduled_tokens == {"dec": 8}
+    # `dec` now decodes (async scheduling schedules its next token right away).
+    scheduler.add_request(_make_real_request("long", 128, hasher, seed=1))
+    out = scheduler.schedule().num_scheduled_tokens
+    assert out.get("dec") == 1
+    # The prefill is capped at 16 tokens but still progresses this step.
+    assert out.get("long") == 16
+    # The cap and budget are restored after the step.
+    assert scheduler.max_num_scheduled_tokens == 64
+    assert scheduler.scheduler_config.long_prefill_token_threshold == 0
+
+
+def test_prefill_step_cap_off_by_default(shared_model_config):
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        scheduler_cls=PrefixAwareScheduler,
+        max_num_batched_tokens=64,
+    )
+    scheduler.add_request(_make_real_request("dec", 8, hasher, seed=3))
+    scheduler.schedule()
+    scheduler.add_request(_make_real_request("long", 128, hasher, seed=1))
+    out = scheduler.schedule().num_scheduled_tokens
+    assert out.get("dec") == 1 and out.get("long") == 63
