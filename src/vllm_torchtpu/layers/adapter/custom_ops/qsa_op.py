@@ -190,7 +190,7 @@ def build_pooled_qsa_group_op():
 
     @op.register_fake
     def fake(
-        qgate,
+        hidden,
         key,
         value,
         index_qk,
@@ -207,6 +207,7 @@ def build_pooled_qsa_group_op():
         main_table,
         compressed_table,
         group_index,
+        q12_w,
         o12,
         compress_ratio,
         token_topk,
@@ -221,9 +222,9 @@ def build_pooled_qsa_group_op():
     ):
         return (
             torch.empty_like(pool),
-            qgate.new_empty((qgate.shape[0], o12.shape[1])),
+            hidden.new_empty((hidden.shape[0], o12.shape[1])),
             positions.new_empty(
-                (qgate.shape[0], token_topk + compress_ratio - 1), dtype=torch.int32
+                (hidden.shape[0], token_topk + compress_ratio - 1), dtype=torch.int32
             ),
         )
 
@@ -614,11 +615,18 @@ def _shard_group_attend_op():
         context,
         pool,
         gathered,
+        hidden,
+        q12_w,
+        nq,
+        positions,
+        trig,
         group_index,
         o12,
         kv_heads,
         compress_ratio,
         token_topk,
+        norm_eps,
+        rotary_dim,
         k_scale=1.0,
         v_scale=1.0,
         main_slot=-1,
@@ -649,10 +657,10 @@ def build_pooled_qsa_shard_op(tp_group, a2a_min_tokens: int = 0, group: bool = F
     trailing ``rows`` operand (as ``build_pooled_qsa_rows_op``) and a
     ``kv_heads`` keyword.
 
-    ``group`` (VLLM_TPU_QSA_GROUP_SPLIT): the operands end with
-    ``group_index`` and ``o12`` instead of ``rows``, the query operand holds
-    the KV group's 12 heads, a ``min_tokens`` keyword is taken, and the
-    output is this rank's projected ``[T, hidden]`` partial
+    ``group`` (VLLM_TPU_QSA_GROUP_SPLIT): operand 0 is the layer's hidden
+    states instead of ``qgate``, the operands end with ``group_index``,
+    ``q12_w`` and ``o12`` instead of ``rows``, a ``min_tokens`` keyword is
+    taken, and the output is this rank's projected ``[T, hidden]`` partial
     (``pooled_qsa_shard_group_attend_step``).
     """
     world = int(tp_group.world_size)
@@ -667,8 +675,21 @@ def build_pooled_qsa_shard_op(tp_group, a2a_min_tokens: int = 0, group: bool = F
         args = list(args)
         group_args = []
         if group:
-            group_args = [args[16].to(torch.int32), args[17]]
+            # Operands end with group_index, q12_w, o12; the split projects
+            # its own queries from the hidden states (operand 0), so the
+            # select step gets a one-head query stub.
+            hidden = args[0]
+            group_args = [
+                hidden,
+                args[17],
+                args[4],
+                args[8].to(torch.int32),
+                args[9],
+                args[16].to(torch.int32),
+                args[18],
+            ]
             args = args[:16]
+            args[0] = hidden.new_zeros((hidden.shape[0], 2 * args[4].shape[0]))
             kwargs = dict(kwargs)
             min_tokens = kwargs.pop("min_tokens")
         for index in (8, 11, 12, 13, 14, 15, 16):
@@ -693,7 +714,11 @@ def build_pooled_qsa_shard_op(tp_group, a2a_min_tokens: int = 0, group: bool = F
             if name in kwargs
         }
         if group:
-            attend_kwargs["min_tokens"] = min_tokens
+            attend_kwargs.update(
+                min_tokens=min_tokens,
+                norm_eps=kwargs["norm_eps"],
+                rotary_dim=kwargs["rotary_dim"],
+            )
         updated, output, selected = attend(
             q,
             gate,
