@@ -68,6 +68,9 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._interleave_step = 0
         self._decode_interleave = max(1, envs.VLLM_TPU_DECODE_INTERLEAVE)
         self._max_wait_s = envs.VLLM_TPU_PAW_MAX_WAIT_S
+        self._interleave_min_decodes = max(
+            1, envs.VLLM_TPU_DECODE_INTERLEAVE_MIN_DECODES
+        )
 
         logger.info(
             "PrefixAwareScheduler ACTIVE (window=%d, decode interleave=%d)",
@@ -133,7 +136,14 @@ class PrefixAwareScheduler(AsyncScheduler):
             # prefill deferral (built for DP prefill balancing); clearing
             # prefill_capacity_bound keeps it deferring under saturation.
             self._interleave_step += 1
-            if self._interleave_step % interleave:
+            min_decodes = getattr(self, "_interleave_min_decodes", 1)
+            decodes = (
+                sum(1 for r in self.running if not r.is_prefill_chunk)
+                if min_decodes > 1
+                else min_decodes
+            )
+            # Only worth giving up prefill steps when enough decodes wait.
+            if self._interleave_step % interleave and decodes >= min_decodes:
                 self.prefill_capacity_bound = False
                 throttle_prefills = True
         return super().schedule(throttle_prefills)

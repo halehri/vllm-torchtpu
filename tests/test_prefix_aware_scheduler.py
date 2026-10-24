@@ -281,3 +281,24 @@ def test_prefix_aware_srpt_scheduler_chains_both_layers():
         s.schedule()
     # PAW runs first and forwards its (interleave) throttle decision to SRPT.
     assert calls == [("srpt", True), ("srpt", False)]
+
+
+def test_decode_interleave_waits_for_enough_decodes():
+    s = _make_scheduler([], {})
+    s._decode_interleave = 2
+    s._interleave_step = 0
+    s._interleave_min_decodes = 3
+    seen = []
+
+    def fake_schedule(self, throttle_prefills=False):
+        seen.append(throttle_prefills)
+
+    decode = SimpleNamespace(is_prefill_chunk=False)
+    prefill = SimpleNamespace(is_prefill_chunk=True)
+    with patch.object(AsyncScheduler, "schedule", fake_schedule):
+        s.running = [decode, decode, prefill]
+        s.schedule()  # odd step, but only 2 decodes: no deferral
+        s.schedule()  # even step: never deferred
+        s.running = [decode, decode, decode, prefill]
+        s.schedule()  # odd step with 3 decodes: deferred
+    assert seen == [False, False, True]

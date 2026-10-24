@@ -194,6 +194,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     VLLM_TPU_DECODE_INTERLEAVE: int = 1
     VLLM_TPU_PAW_MAX_WAIT_S: float = 0.0
+    VLLM_TPU_DECODE_INTERLEAVE_MIN_DECODES: int = 1
     VLLM_TPU_FUSED_ASYNC_DRAFT_SEED: bool = True
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
     VLLM_TPU_MTP_DRAFT_ROWS: bool = False
@@ -1214,6 +1215,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # PrefixAwareScheduler: of every N steps, N - 1 defer prefill work while a
     # decode is running (decode-priority interleave). 1 = off.
     "VLLM_TPU_DECODE_INTERLEAVE": env_int("VLLM_TPU_DECODE_INTERLEAVE", 1),
+    # Decode interleave applies only while at least this many decodes run.
+    "VLLM_TPU_DECODE_INTERLEAVE_MIN_DECODES": env_int(
+        "VLLM_TPU_DECODE_INTERLEAVE_MIN_DECODES", 1
+    ),
     # PrefixAwareScheduler: a request waiting longer than this many seconds
     # outranks warm ones (oldest first). 0 = off (pure warmest-first).
     "VLLM_TPU_PAW_MAX_WAIT_S": lambda: float(
