@@ -957,17 +957,21 @@ class TestLoadJobLifecycle(unittest.TestCase):
         self.assertEqual(self.manager.lookup(_key(0), _ctx("r1")), LookupResult.HIT)
 
     def test_request_is_not_offered_the_failed_part_of_a_polled_load_again(self):
-        # Only key 1's transfer fails: r1 may still load key 0.
+        # Only the second key's transfer fails. The first precedes it in the
+        # same KV cache group, so r1 may still load it.
+        keys = [_group_key(n, group_idx=0) for n in range(2)]
+        for key in keys:
+            seed_host_entries(self.store, key)
         self.manager.on_new_request(_ctx("r1"))
-        self.manager.prepare_load([_key(0), _key(1)], _ctx("r1"))
-        self.manager.submit_load_job(3, [_key(0), _key(1)], [10, 11], "r1")
-        self.store.complete_load(sub_hashes(_key(0)))
-        self.store.complete_load(sub_hashes(_key(1)), success=False)
+        self.manager.prepare_load(keys, _ctx("r1"))
+        self.manager.submit_load_job(3, keys, [10, 11], "r1")
+        self.store.complete_load(sub_hashes(keys[0]))
+        self.store.complete_load(sub_hashes(keys[1]), success=False)
         (finished_job,) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
-        self.assertEqual(self.manager.lookup(_key(0), _ctx("r1")), LookupResult.HIT)
-        self.assertEqual(self.manager.lookup(_key(1), _ctx("r1")), LookupResult.MISS)
-        self.assertEqual(self.manager.lookup(_key(1), _ctx("r2")), LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(keys[0], _ctx("r1")), LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(keys[1], _ctx("r1")), LookupResult.MISS)
+        self.assertEqual(self.manager.lookup(keys[1], _ctx("r2")), LookupResult.HIT)
         self.assertEqual(self.store.pinned_hashes(), {})
 
     def test_failed_transfer_marks_the_rest_of_its_group(self):
@@ -2045,7 +2049,9 @@ class TestRemoteReadFlow(unittest.TestCase):
         self.assertEqual(self.manager.lookup(key, _ctx("r2")), LookupResult.HIT)
 
     def test_mixed_job_marks_only_the_peer_keys_whose_read_failed(self):
-        local_key, remote_key = _key(1), _key(2)
+        # The local key precedes the failed peer key in the same KV cache
+        # group, so it stays loadable.
+        local_key, remote_key = (_group_key(n, group_idx=0) for n in (1, 2))
         seed_host_entries(self.store, local_key)
         seed_global_entries(self.store, remote_key)
         self.manager.on_new_request(_ctx("r1"))
