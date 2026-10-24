@@ -1599,8 +1599,13 @@ def _shard_attend(
     main_slot,
     max_query_len,
     merged,
+    group=None,
 ):
     """Merge the gathered candidates, attend, and pick ``rows`` if given.
+
+    ``group`` (``(group_index, o12, min_tokens)``): finish through the
+    KV-group split (``_group_attend``) on the merged global blocks; ``q`` /
+    ``gate`` then hold the group's 12 heads.
 
     ``gathered`` is ``[ranks, tokens, k, 2]`` candidates, or ``[tokens, k]``
     already merged blocks when ``merged``. ``k_scale``/``v_scale`` are the
@@ -1620,6 +1625,24 @@ def _shard_attend(
         merge,
         None,
     )
+    if group is not None:
+        assert rows is None, "the group split covers all-token steps"
+        return _group_attend(
+            pool,
+            q,
+            gate,
+            blocks,
+            lengths,
+            main_table[req],
+            starts,
+            group,
+            compress_ratio=compress_ratio,
+            token_topk=token_topk,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            main_slot=main_slot,
+            max_query_len=max_query_len,
+        )
     keep = picked = None
     if rows is not None and len(rows) > len(context):
         keep = rows >= 0
@@ -1683,6 +1706,53 @@ def pooled_qsa_shard_attend_step(
         main_slot=main_slot,
         max_query_len=max_query_len,
         merged=merged,
+    )
+
+
+def pooled_qsa_shard_group_attend_step(
+    q: jax.Array,
+    gate: jax.Array,
+    lengths: jax.Array,
+    req: jax.Array,
+    starts: jax.Array,
+    main_table: jax.Array,
+    context: jax.Array,
+    pool: jax.Array,
+    gathered: jax.Array,
+    group_index: jax.Array,
+    o12: jax.Array,
+    kv_heads: int,
+    compress_ratio: int,
+    token_topk: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    merged: bool = False,
+    min_tokens: int = 1024,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_shard_attend_step`` under the KV-group split: merge, then
+    the group attention; returns ``(pool, partial [T, hidden], selected)``."""
+    return _shard_attend(
+        q,
+        gate,
+        lengths,
+        req,
+        starts,
+        main_table,
+        context,
+        pool,
+        gathered,
+        None,
+        kv_heads=kv_heads,
+        compress_ratio=compress_ratio,
+        token_topk=token_topk,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        main_slot=main_slot,
+        max_query_len=max_query_len,
+        merged=merged,
+        group=(group_index, o12, min_tokens),
     )
 
 

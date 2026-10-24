@@ -463,6 +463,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self.main_slot = max(main_slot, 0)
         self._shard_op = None
         self._shard_select_op = None
+        self._shard_group_op = None
         if envs.VLLM_TPU_QSA_INDEXER_SHARD and self.tp_size > 1:
             from vllm.distributed import get_tp_group
 
@@ -483,6 +484,18 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 kv_heads=self.num_kv_heads,
                 **keywords,
             )
+            if self.group_split:
+                # Sharded indexer, then the KV-group split attention.
+                self._shard_group_op = partial(
+                    build_pooled_qsa_shard_op(
+                        group,
+                        envs.VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS,
+                        group=True,
+                    ),
+                    kv_heads=self.num_kv_heads,
+                    min_tokens=envs.VLLM_TPU_QSA_GROUP_SPLIT_MIN_TOKENS,
+                    **keywords,
+                )
             if self._select_op is not None:
                 # The megakernel's select op, with the indexer sharded too.
                 from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
@@ -672,7 +685,10 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         """``(o_proj partial [T, hidden], selected)`` under the KV-group split."""
         assert self._group_op is not None and len(self.cache_owners) == 1
         metadata = self._pooled_metadata(metadata)
-        return self._group_op(
+        # With VLLM_TPU_QSA_INDEXER_SHARD too: the sharded indexer's candidates
+        # are merged first, then the same group attention.
+        op = self._shard_group_op or self._group_op
+        return op(
             self.q12_proj(hidden),
             self.k_proj(hidden),
             self.v_proj(hidden),
