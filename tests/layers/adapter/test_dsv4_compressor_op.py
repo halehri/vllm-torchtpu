@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -22,6 +23,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     get_group_id,
@@ -199,6 +201,19 @@ def test_run_local_state_does_not_group_with_a_cacheable_window():
     assert run_local.is_uniform_with_collection({"a": run_local, "b": run_local})
 
 
+@pytest.fixture
+def upstream_block_pool(monkeypatch):
+    """Undo the plugin's same-step prefix-hit patch, if installed.
+
+    Once the platform activates (any earlier test in the process can trigger
+    it), every block hashed since the last `Scheduler.schedule()` is a miss.
+    These tests drive `KVCacheManager` without a scheduler, so all hits would
+    be 0.
+    """
+    for name in ("_insert_block_hash", "get_cached_block"):
+        monkeypatch.setattr(BlockPool, name, inspect.unwrap(getattr(BlockPool, name)))
+
+
 def _manager(num_blocks, run_local=True):
     init_none_hash(sha256)
     csa_state = _state_cache(4)._derive_block_size(BLOCK)
@@ -319,7 +334,7 @@ def _scenario(mgr):
     return hits
 
 
-def test_run_local_state_leaves_prefix_hits_unchanged():
+def test_run_local_state_leaves_prefix_hits_unchanged(upstream_block_pool):
     expected = _scenario(_manager(130, run_local=False))
     assert _scenario(_manager(130)) == expected
     assert expected[0] == 39_936
@@ -332,7 +347,7 @@ def test_run_local_state_leaves_prefix_hits_unchanged():
     assert _cached_blocks(fresh, HCA_STATE) == 0
 
 
-def test_run_local_state_caches_and_offloads_nothing():
+def test_run_local_state_caches_and_offloads_nothing(upstream_block_pool):
     base = _manager(400, run_local=False)
     _run(base, TURN1)
     lean = _manager(400)
