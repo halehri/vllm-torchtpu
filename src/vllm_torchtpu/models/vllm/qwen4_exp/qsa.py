@@ -437,7 +437,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             keywords["main_slot"] = main_slot
         self._op = partial(build_pooled_qsa_op(), **keywords)
         self._rows_op = partial(build_pooled_qsa_rows_op(), **keywords)
-        if self.group_split:
+        if self.group_split_active:
             from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
                 build_pooled_qsa_group_op,
             )
@@ -484,13 +484,11 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 kv_heads=self.num_kv_heads,
                 **keywords,
             )
-            if self.group_split:
+            if self.group_split_active:
                 # Sharded indexer, then the KV-group split attention.
                 self._shard_group_op = partial(
                     build_pooled_qsa_shard_op(
-                        group,
-                        envs.VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS,
-                        group=True,
+                        group, a2a_min_tokens, kv_group_split=True
                     ),
                     kv_heads=self.num_kv_heads,
                     min_tokens=envs.VLLM_TPU_QSA_GROUP_SPLIT_MIN_TOKENS,
@@ -652,7 +650,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         caches are still written for every token. Pooled QSA attends only
         the rows; the dedicated-cache path attends all tokens and picks.
         """
-        if self.group_split and rows is None:
+        if self.group_split_active and rows is None:
             # Already this rank's o_proj partial (VLLM_TPU_QSA_GROUP_SPLIT).
             output, selected = self._group_attend(hidden, positions, metadata)
         else:
@@ -663,6 +661,13 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         if reduce and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output)
         return output, selected
+
+    @property
+    def group_split_active(self) -> bool:
+        """Whether forward runs the KV-group split: not in a single-graph module
+        (the MTP draft), whose one graph serves every token bucket and which
+        only has decode-sized steps the split would not take anyway."""
+        return self.group_split and not self.single_graph
 
     def _pooled_metadata(self, metadata: QSAMetadata) -> QSAMetadata:
         per_layer = cast(
