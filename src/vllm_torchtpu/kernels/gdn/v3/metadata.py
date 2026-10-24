@@ -72,6 +72,7 @@ def compute_per_seq_metadata(
     start_seq: jax.Array,
     end_seq: jax.Array,
     ckpt_indices: jax.Array | None = None,
+    pre_rolled: bool = False,
 ) -> memory_ref.MetadataRef:
     """Metadata for computing single sequence per tile.
 
@@ -81,6 +82,9 @@ def compute_per_seq_metadata(
     prefix-cache resume on the unified pool may land on a boundary state
     block whose committed state is a non-zero checkpoint from a verify step.
     The final state is always written to checkpoint 0.
+
+    `pre_rolled`: the caller already rolled the per-sequence inputs so that
+    element 0 is `start_seq` (`jnp.roll(x, -start_seq)`, sequence axis).
     """
     max_seqs = seq_lens.size
     max_tokens = cfg.batch_size
@@ -88,14 +92,15 @@ def compute_per_seq_metadata(
     all_tokens = jnp.arange(max_tokens)
 
     # Shift to ensure first element is for start_seq.
-    query_start_loc = jnp.roll(query_start_loc, shift=-start_seq)
-    seq_lens = jnp.roll(seq_lens, shift=-start_seq)
-    state_indices = jnp.roll(state_indices, shift=-start_seq)
-    read_offsets = jnp.roll(read_offsets, shift=-start_seq)
-    if ckpt_indices is not None:
-        # Sequence-major axis only: the checkpoint axis must stay put or the
-        # read offset would select another slot's block.
-        ckpt_indices = jnp.roll(ckpt_indices, shift=-start_seq, axis=0)
+    if not pre_rolled:
+        query_start_loc = jnp.roll(query_start_loc, shift=-start_seq)
+        seq_lens = jnp.roll(seq_lens, shift=-start_seq)
+        state_indices = jnp.roll(state_indices, shift=-start_seq)
+        read_offsets = jnp.roll(read_offsets, shift=-start_seq)
+        if ckpt_indices is not None:
+            # Sequence-major axis only: the checkpoint axis must stay put or
+            # the read offset would select another slot's block.
+            ckpt_indices = jnp.roll(ckpt_indices, shift=-start_seq, axis=0)
 
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
     # NOTE: query_lens is used for calculating num_tiles. Defensive programming

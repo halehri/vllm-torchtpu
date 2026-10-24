@@ -175,6 +175,44 @@ def gdn_attention_core_tpu(
     return new_conv_state, new_recurrent_state, output
 
 
+def _roll_left(x: torch.Tensor, shift: torch.Tensor) -> torch.Tensor:
+    """`jnp.roll(x, -shift, axis=0)` for a traced `shift`."""
+    n = x.shape[0]
+    idx = torch.remainder(torch.arange(n, device=x.device) + shift.long(), n)
+    return x.index_select(0, idx)
+
+
+def _roll_per_seq_inputs(
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    state_indices: torch.Tensor,
+    slot_read_offsets: torch.Tensor | None,
+    ckpt_indices: torch.Tensor | None,
+    shift: torch.Tensor,
+    *,
+    offsets_per_seq: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """The per-sequence GDN metadata inputs rolled to start at `shift`.
+
+    Packed as `[query_start_loc | seq_lens | state_indices | read_offsets]`
+    for `compute_per_seq_metadata(pre_rolled=True)`, plus the checkpoint
+    indices rolled along the sequence axis. Built in the step graph, these are
+    identical for every GDN layer, so XLA keeps one copy per step.
+    """
+    if slot_read_offsets is None:
+        offsets = torch.zeros_like(state_indices)
+    elif offsets_per_seq:
+        offsets = slot_read_offsets
+    else:
+        offsets = slot_read_offsets[state_indices]
+    parts = (query_start_loc, seq_lens, state_indices, offsets)
+    packed = torch.cat([_roll_left(x.to(torch.int32), shift) for x in parts])
+    ckpt = None
+    if ckpt_indices is not None:
+        ckpt = _roll_left(ckpt_indices.to(torch.int32), shift)
+    return packed, ckpt
+
+
 def gdn_attention_pooled_core_tpu(
     mixed_qkv: jax.Array | Conv1DInput,
     b: jax.Array,
@@ -190,6 +228,8 @@ def gdn_attention_pooled_core_tpu(
     seq_lens: jax.Array,
     slot_read_offsets: jax.Array | None = None,
     ckpt_indices: jax.Array | None = None,
+    per_seq_rolled: jax.Array | None = None,
+    per_seq_rolled_ckpt: jax.Array | None = None,
     *,
     mesh: jax.sharding.Mesh,
     n_kq: int,
@@ -231,6 +271,8 @@ def gdn_attention_pooled_core_tpu(
         num_spec_tokens=num_spec_tokens,
         conv_weight_kmajor=conv_weight_kmajor,
         read_offsets_per_seq=read_offsets_per_seq,
+        per_seq_rolled=per_seq_rolled,
+        per_seq_rolled_ckpt=per_seq_rolled_ckpt,
     )
 
 
@@ -766,6 +808,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # per-layer op: the gather is then identical across GDN layers and
         # XLA keeps one per step instead of one per layer.
         hoist_read_offsets = envs.VLLM_TPU_GDN_HOIST_READ_OFFSETS
+        # Roll the per-sequence metadata inputs to the first prefill sequence
+        # in the step graph, where the rolls are identical across GDN layers.
+        hoist_rolls = envs.VLLM_TPU_GDN_HOIST_PER_SEQ_ROLLS
 
         # Written out rather than functools.partial so pool_block_tokens is
         # read per call instead of at build time; pallas.jax_op requires a
@@ -785,6 +830,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             seq_lens: jax.Array,
             slot_read_offsets: jax.Array | None = None,
             ckpt_indices: jax.Array | None = None,
+            per_seq_rolled: jax.Array | None = None,
+            per_seq_rolled_ckpt: jax.Array | None = None,
         ) -> tuple[jax.Array, jax.Array]:
             # Fold the `(num_blocks, rows_per_block, *page)` block-major pool so
             # pool adapters index flat kernel blocks along dim 0; both reshapes
@@ -806,6 +853,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 seq_lens,
                 slot_read_offsets,
                 ckpt_indices,
+                per_seq_rolled,
+                per_seq_rolled_ckpt,
                 mesh=mesh,
                 n_kq=n_kq,
                 n_v=local_num_v_heads,
@@ -862,6 +911,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 num_spec_tokens,
                 conv_weight_kmajor,
                 hoist_read_offsets,
+                hoist_rolls,
             ),
             build_op,
         )
@@ -884,6 +934,17 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         ) -> torch.Tensor:
             if hoist_read_offsets and slot_read_offsets is not None:
                 slot_read_offsets = slot_read_offsets[state_indices]
+            rolled: tuple[torch.Tensor | None, ...] = ()
+            if hoist_rolls:
+                rolled = _roll_per_seq_inputs(
+                    query_start_loc,
+                    seq_lens,
+                    state_indices,
+                    slot_read_offsets,
+                    ckpt_indices,
+                    request_distribution[0],
+                    offsets_per_seq=hoist_read_offsets,
+                )
             new_rec, outputs = gdn_jax_op(
                 mixed_qkv,
                 b,
@@ -899,6 +960,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 seq_lens,
                 slot_read_offsets,
                 ckpt_indices,
+                *rolled,
             )
 
             # Plain donation + copy_ writeback (aliased in-place by XLA).

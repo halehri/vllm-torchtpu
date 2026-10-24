@@ -396,6 +396,8 @@ def fused_conv1d_gdn(
     state_plan: config.StateSourcePlan | None = None,
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
+    per_seq_rolled: jax.Array | None = None,
+    per_seq_rolled_ckpt: jax.Array | None = None,
     batched_only: bool = False,
     prefill_only: bool = False,
     zero_initialize_out: bool = True,
@@ -563,6 +565,13 @@ def fused_conv1d_gdn(
             num_spec_tokens,
         )
         ckpt_indices = ckpt_indices.astype(jnp.int32)
+    if per_seq_rolled is not None:
+        assert per_seq_rolled.shape == (4 * num_seqs + 1,), per_seq_rolled.shape
+        assert (per_seq_rolled_ckpt is None) == (ckpt_indices is None)
+        per_seq_rolled = per_seq_rolled.astype(jnp.int32)
+        if per_seq_rolled_ckpt is not None:
+            assert per_seq_rolled_ckpt.shape == ckpt_indices.shape
+            per_seq_rolled_ckpt = per_seq_rolled_ckpt.astype(jnp.int32)
     act_in_dtype = jnp.dtype(jnp.float32)
     assert a.dtype == b.dtype == act_in_dtype
 
@@ -720,6 +729,21 @@ def fused_conv1d_gdn(
                 read_offsets=read_offsets,
                 end_seq=distribution[0],
                 ckpt_indices=ckpt_indices,
+            )
+        elif per_seq_rolled is not None:
+            # [query_start_loc | seq_lens | state_indices | read_offsets],
+            # each already rolled to start at distribution[0].
+            n = num_seqs
+            metadata_obj = metadata.compute_per_seq_metadata(
+                cfg=cfg,
+                seq_lens=per_seq_rolled[n + 1 : 2 * n + 1],
+                query_start_loc=per_seq_rolled[: n + 1],
+                state_indices=per_seq_rolled[2 * n + 1 : 3 * n + 1],
+                read_offsets=per_seq_rolled[3 * n + 1 :],
+                start_seq=distribution[0],
+                end_seq=distribution[-1],
+                ckpt_indices=per_seq_rolled_ckpt,
+                pre_rolled=True,
             )
         else:
             metadata_obj = metadata.compute_per_seq_metadata(
