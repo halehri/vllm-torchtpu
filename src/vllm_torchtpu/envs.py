@@ -214,6 +214,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
     VLLM_TPU_SEGMENT_TOKENIZE_VERIFY: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
+    VLLM_TPU_MTP_SHARDED_ARGMAX: bool = False
     VLLM_TPU_FUSED_ASYNC_DRAFT_SEED: bool = True
     VLLM_TPU_DEFER_PREV_RESULTS_WAIT: bool = False
     VLLM_TPU_LOG_POST_WARMUP_COMPILES: bool = False
@@ -1346,6 +1347,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
     "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
+    # With VLLM_TPU_FUSED_DRAFT_LOOP: take each draft step's greedy token from
+    # a vocab-parallel argmax (local max per TP rank, then an all-gather of
+    # [rows, 2] pairs) instead of all-gathering the full logits first.
+    "VLLM_TPU_MTP_SHARDED_ARGMAX": env_bool("VLLM_TPU_MTP_SHARDED_ARGMAX"),
     # Log one WARNING per torch.compile compile after warmup (runner/compile_watch.py).
     "VLLM_TPU_LOG_POST_WARMUP_COMPILES": env_bool(
         "VLLM_TPU_LOG_POST_WARMUP_COMPILES", default=False

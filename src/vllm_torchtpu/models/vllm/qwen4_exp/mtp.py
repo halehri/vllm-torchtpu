@@ -325,6 +325,10 @@ class Qwen4ExpMTP(nn.Module):
             draft_rows,
         )
 
+    # One head for every draft step: the fused draft loop may take its greedy
+    # tokens from a vocab-parallel argmax over it (VLLM_TPU_MTP_SHARDED_ARGMAX).
+    sharded_argmax_head = True
+
     def compute_logits(self, hidden_states, spec_step_idx: int = 0):
         return self.logits_processor(self.lm_head, hidden_states)
 
