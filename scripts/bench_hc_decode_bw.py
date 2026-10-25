@@ -57,7 +57,8 @@ def test_hc_decode_bandwidth():
     def copy_all(ws):
         return [a + jnp.bfloat16(0) for a in ws]
 
-    t_copy = timed(copy_all, ws)
+    ws = list(ws) + [ws[1].astype(jnp.float8_e4m3fn)]
+    t_copy = timed(copy_all, ws[:4])
     copy_bw = 2 * per_call * N / t_copy / 1e9  # read + write
     print("HCBW " + json.dumps(dict(kind="copy", bytes_per_call=per_call,
                                     ms_per_call=t_copy / N * 1e3, gbps=copy_bw)), flush=True)
@@ -77,8 +78,18 @@ def test_hc_decode_bandwidth():
         def up_vpu(g, u):
             return jnp.sum(g.astype(jnp.float32)[:, None, :] * u.astype(jnp.float32)[None], axis=-1)
 
-        for kind, fn, arg, wi in (("down_mxu", down_mxu, x, 1), ("down_vpu", down_vpu, x, 1),
-                                  ("up_mxu", up_mxu, g, 2), ("up_vpu", up_vpu, g, 2)):
+        def down_fp8(x, d):
+            return jnp.dot(x.astype(jnp.float8_e4m3fn), d.T, preferred_element_type=jnp.float32)
+
+        def down_fp8w(x, d):
+            return jnp.dot(x, d.T.astype(jnp.bfloat16), preferred_element_type=jnp.float32)
+
+        def down_t(x, d):
+            return jnp.dot(d, x.T, preferred_element_type=jnp.float32).T
+
+        for kind, fn, arg, wi in (("down_mxu", down_mxu, x, 1), ("down_t", down_t, x, 1),
+                                  ("down_fp8", down_fp8, x, 4), ("down_fp8w_upcast", down_fp8w, x, 4),
+                                  ("up_mxu", up_mxu, g, 2)):
 
             @jax.jit
             def runp(a, ws, fn=fn, wi=wi):
@@ -91,7 +102,7 @@ def test_hc_decode_bandwidth():
             nb = int(np.prod(ws[wi].shape[1:])) * 2
             print("HCBW " + json.dumps(dict(kind=kind, rows=rows, ms_per_call=t / N * 1e3,
                                             gbps=nb * N / t / 1e9)), flush=True)
-    for rows in (4, 8, 32, 64):
+    for rows in ():
         x = jnp.asarray(rng.normal(0, 1, (rows, WIDTH)), jnp.bfloat16)
         for kind, fn in (("fused", hc_decode_mix),):
 
