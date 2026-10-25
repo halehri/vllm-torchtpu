@@ -627,6 +627,8 @@ class Qwen4ExpBackbone(nn.Module):
         layers = cast(Sequence[Qwen4ExpDecoderLayer], self.layers)
         qsa_layers = [i for i, layer in enumerate(layers) if layer.layer_type == "full_attention"]
         head_groups = getattr(segment_call, "head_groups", None)
+        mk_outs: list = []
+        st_outs: list = []
         if head_groups:
             # Layers before the first QSA layer: one kernel call per group, the
             # per-layer embedding added before the group that starts at its layer.
@@ -634,6 +636,30 @@ class Qwen4ExpBackbone(nn.Module):
                 hidden = layers[group[0]].apply_ple(
                     hidden, ids64, query_start_loc, ngram_context, state_slots, context_lens
                 )
+                if check_parts:
+                    # The stock group on the same input, its PLE already applied.
+                    y_mk = segment_call.head(h, hidden)
+                    first = layers[group[0]]
+                    ple, first.ple = first.ple, None
+                    try:
+                        for stock in layers[group[0] : group[-1] + 1]:
+                            hidden = stock(
+                                hidden,
+                                positions64,
+                                ids64,
+                                query_start_loc,
+                                ngram_context,
+                                state_slots,
+                                context_lens,
+                                valid_tokens,
+                                main_block_table,
+                                compressed_block_table,
+                            )
+                    finally:
+                        first.ple = ple
+                    mk_outs.append(y_mk)
+                    st_outs.append(hidden)
+                    continue
                 hidden = segment_call.head(h, hidden)
         else:
             for layer in layers[: qsa_layers[0]]:
@@ -671,8 +697,6 @@ class Qwen4ExpBackbone(nn.Module):
         # the same input; the stock output continues, and both are returned
         # stacked [n_seg, T, hc*H] for the driver to compare.
         check = check_parts
-        mk_outs: list = []
-        st_outs: list = []
         for s, i in enumerate(qsa_layers):
             layer = layers[i]
             if s >= n_mk:

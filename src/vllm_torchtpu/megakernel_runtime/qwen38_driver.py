@@ -428,6 +428,7 @@ class Qwen38SegmentDriver:
         self.shadow = None
         self.segcheck_left = 0  # `segcheck=N`: in-program per-segment kernel vs stock on N real steps
         self.segstock = False
+        self.seghead = False
         self.segcheck = None
         self.stats: dict[str, int] = {}
         self.mtp = False
@@ -472,6 +473,7 @@ class Qwen38SegmentDriver:
         # `segstock=1`: steps that are not segcheck steps run the stock model, so
         # the GDN pool only ever holds checkpoints the stock layers wrote.
         drv.segstock = _parse_flag(raw, "segstock", False)
+        drv.seghead = _parse_flag(raw, "seghead", False)
         segs = _parse_int(raw, "segs")
         if segs is not None:
             drv.segments.mk_segments = segs
@@ -570,8 +572,11 @@ class Qwen38SegmentDriver:
         if self.segcheck_left > 0:
             # Head layers run stock here (they commit their GDN / PLE state);
             # segment kernels write no GDN checkpoints, their stock layers do.
+            # `seghead=1`: the head groups are compared too (their kernels write no
+            # GDN state here; the stock head layers do).
             check_seg = Qwen38Segments(
-                runner.model, self.g, self.mesh, self.buckets, shared=self.segments, head=False
+                runner.model, self.g, self.mesh, self.buckets, shared=self.segments,
+                head=self.seghead and bool(self.segments.head_groups),
             )
             check_seg.bind_pool()
             from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpSegmentCheckModel
@@ -596,10 +601,12 @@ class Qwen38SegmentDriver:
         )
         hc = runner.model.model.hc_count
         n = int(valid.sum())
+        n_head = len(self.segcheck.segments.head_groups)
         for s in range(mk.shape[0]):
+            name = f"head{s}" if s < n_head else f"seg{s - n_head}"
             logger.info(
-                "qwen38 megakernel segcheck seg%d rows=%d %s (%d left)",
-                s, n, _stream_stats(mk[s], st[s], valid, hc), self.segcheck_left - 1,
+                "qwen38 megakernel segcheck %s rows=%d %s (%d left)",
+                name, n, _stream_stats(mk[s], st[s], valid, hc), self.segcheck_left - 1,
             )
         self.segcheck_left -= 1
         return (mixed, hidden) if runner.model.model.emit_mtp_hidden else mixed
