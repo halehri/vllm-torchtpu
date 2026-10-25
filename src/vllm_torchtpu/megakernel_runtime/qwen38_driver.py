@@ -431,6 +431,8 @@ class Qwen38SegmentDriver:
         self.seghead = False
         self.segdump = False  # `segdump=1`: torch.save the first check step (ranks 0, 3)
         self.segcheck_dumped = 0
+        self.segserve = ""
+        self.segcheck_logged = 0
         self.segcheck = None
         self.stats: dict[str, int] = {}
         self.mtp = False
@@ -477,6 +479,11 @@ class Qwen38SegmentDriver:
         drv.segstock = _parse_flag(raw, "segstock", False)
         drv.seghead = _parse_flag(raw, "seghead", False)
         drv.segdump = _parse_flag(raw, "segdump", False)
+        # `segserve=mk_stockaux|stock_mkaux`: every check step serves the target
+        # logits from one path and the MTP draft's 4-stream hidden from the other.
+        for part in raw.split(","):
+            if part.startswith("segserve="):
+                drv.segserve = part[len("segserve=") :]
         segs = _parse_int(raw, "segs")
         if segs is not None:
             drv.segments.mk_segments = segs
@@ -607,6 +614,10 @@ class Qwen38SegmentDriver:
         hc = runner.model.model.hc_count
         n = int(valid.sum())
         n_head = len(self.segcheck.segments.head_groups)
+        self.segcheck_logged += 1
+        self.segcheck_left -= 1
+        if self.segcheck_logged > 20:
+            return self._segserve_out(runner, mixed, hidden, mixed_chain, chain)
         for s in range(mk.shape[0]):
             name = f"head{s}" if s < n_head else f"seg{s - n_head}"
             logger.info(
@@ -630,7 +641,15 @@ class Qwen38SegmentDriver:
                 "top_mk": top_mk, "top_st": top_st,
             })
             self.segcheck_dumped += 1
-        self.segcheck_left -= 1
+        return self._segserve_out(runner, mixed, hidden, mixed_chain, chain)
+
+    def _segserve_out(self, runner: Any, mixed: Any, hidden: Any, mixed_chain: Any, chain: Any) -> Any:
+        if self.segserve == "mk_stockaux":
+            mixed = mixed_chain
+        elif self.segserve == "stock_mkaux":
+            hidden = chain
+        elif self.segserve == "mk":
+            mixed, hidden = mixed_chain, chain
         return (mixed, hidden) if runner.model.model.emit_mtp_hidden else mixed
 
     def _segdump(self, runner: Any, input_ids: Any, positions: Any, kw: dict, outs: dict) -> None:
