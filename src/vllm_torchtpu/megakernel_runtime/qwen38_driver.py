@@ -98,12 +98,19 @@ def _own_operand(t: torch.Tensor, param_storages: set[int]) -> torch.Tensor:
     strides) of a temporary; torch_tpu then re-materialises it in its own
     `execute_as_strided` program on every call (q32 j-f243a216: ~1.5 ms/step
     of copies plus one dispatch each). Such tensors are copied once into a
-    fresh base allocation. Views of model parameters (the routed experts) are
-    zero-copy operands and stay as they are.
+    fresh base allocation, small parameter views (a transposed o_proj) too.
+    The routed experts are the parameters themselves (no view); a large
+    parameter view is kept, with a warning, rather than duplicated in HBM.
     """
-    if int(t.untyped_storage().data_ptr()) in param_storages:
-        return t
     if t._base is None and t.storage_offset() == 0 and t.is_contiguous():
+        return t
+    if int(t.untyped_storage().data_ptr()) in param_storages and t.numel() * t.element_size() > (64 << 20):
+        # A large parameter view (would duplicate HBM): keep it, and say so.
+        logger.warning(
+            "qwen38 megakernel: operand %s is a view of a parameter (offset %d, contiguous %s); "
+            "torch_tpu materialises it per call",
+            tuple(t.shape), t.storage_offset(), t.is_contiguous(),
+        )
         return t
     return torch.empty_like(t, memory_format=torch.contiguous_format).copy_(t)
 
