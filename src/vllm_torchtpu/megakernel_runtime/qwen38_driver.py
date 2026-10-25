@@ -427,6 +427,7 @@ class Qwen38SegmentDriver:
         self.check_left = 0
         self.shadow = None
         self.segcheck_left = 0  # `segcheck=N`: in-program per-segment kernel vs stock on N real steps
+        self.segstock = False
         self.segcheck = None
         self.stats: dict[str, int] = {}
         self.mtp = False
@@ -468,6 +469,9 @@ class Qwen38SegmentDriver:
         drv = cls(runner, _parse_buckets(raw), head=_parse_flag(raw, "head", True))
         drv.check_left = _parse_check(raw)
         drv.segcheck_left = _parse_int(raw, "segcheck") or 0
+        # `segstock=1`: steps that are not segcheck steps run the stock model, so
+        # the GDN pool only ever holds checkpoints the stock layers wrote.
+        drv.segstock = _parse_flag(raw, "segstock", False)
         segs = _parse_int(raw, "segs")
         if segs is not None:
             drv.segments.mk_segments = segs
@@ -763,6 +767,8 @@ class Qwen38SegmentDriver:
                 and _real_traffic(kw)
             ):
                 out = self._segcheck_step(runner, input_ids, positions, kw)
+            elif self.segstock:
+                return False, None
             elif self.check_left > 0 and self.shadow is not None:
                 out = self._shadow_step(runner, input_ids, positions, kw)
             else:
