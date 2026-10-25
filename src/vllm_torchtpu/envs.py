@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_QWEN4_HC_DECODE_FUSED: bool = False
+    VLLM_TPU_MOE_EXPERT_HIST: int = 0
     QWEN4_EXP_PREFILL_SP: bool = False
     QWEN4_EXP_PREFILL_SP_MIN_TOKENS: int = 1024
     QWEN4_EXP_PREFILL_SP_MOE: bool = False
@@ -823,6 +824,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gate, branch mean and the combine's injection gate) at <= 512 tokens as
     # one Pallas call, with the attn combine fused ahead of the mlp mix.
     "TPU_QWEN4_HC_DECODE_FUSED": env_bool("TPU_QWEN4_HC_DECODE_FUSED"),
+    # Debug: when > 0, every MoE layer counts its routed top-k expert ids in a
+    # device buffer, and the model logs the per-EP-rank load once, after this
+    # many forward calls (padded bucket rows are counted too).
+    "VLLM_TPU_MOE_EXPERT_HIST": lambda: int(os.getenv("VLLM_TPU_MOE_EXPERT_HIST", "0")),
     # qwen4_exp: shard prefill-sized steps across TP ranks between attention
     # blocks (reduce-scatter instead of all-reduce), so the hyper-connection
     # streams, PLE gate and residual math run on 1/TP of the tokens. Steps

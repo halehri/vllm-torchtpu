@@ -881,6 +881,8 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
 
     def forward(self, input_ids, positions, inputs_embeds=None, **kwargs):
+        if envs.VLLM_TPU_MOE_EXPERT_HIST > 0:
+            self._expert_load_window()
         # The route reads the padded bucket size outside both compiled graphs.
         if self.model_sp is None:
             return self.model(input_ids, positions, inputs_embeds, **kwargs)
@@ -890,6 +892,37 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 return self.model_sp(input_ids, positions, inputs_embeds, **kwargs)
         with bucket_filter.serving(bucket_filter.assigned(self.model)):
             return self.model(input_ids, positions, inputs_embeds, **kwargs)
+
+    def _expert_load_window(self):
+        """Debug only: zero the MoE expert histograms after N forward calls
+        (dropping warmup) and log the per-EP-rank load once after 2N."""
+        self._hist_calls = getattr(self, "_hist_calls", 0) + 1
+        n = envs.VLLM_TPU_MOE_EXPERT_HIST
+        if self._hist_calls not in (n, 2 * n):
+            return
+        layers = [(name, m) for name, m in self.named_modules()
+                  if getattr(m, "expert_hist", None) is not None]
+        if self._hist_calls == n:
+            for _, m in layers:
+                m.expert_hist.zero_()
+            return
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        from vllm_torchtpu.layers.adapter.moe_routing import format_expert_load
+
+        merged = {}
+        for name, m in layers:
+            # The SP backbone's layers count the same model layer.
+            key = name.split("layers.", 1)[-1]
+            hist = m.expert_hist.cpu().tolist()
+            prev = merged.get(key)
+            merged[key] = (hist if prev is None else [a + b for a, b in zip(prev[0], hist)],
+                           m.moe_config.ep_size)
+        if get_tensor_model_parallel_rank() != 0:
+            return
+        print(f"moe expert load over forward calls {n}..{2 * n}", flush=True)
+        for key, (hist, ep) in merged.items():
+            print(format_expert_load(key, hist, max(ep, 1)), flush=True)
 
     def embed_input_ids(self, input_ids):
         return self.model.embed_tokens(input_ids)

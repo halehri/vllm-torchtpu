@@ -163,6 +163,15 @@ def route(
     duplicated in each quant method; centralizing it here means the simulation
     hook -- and any future routing-path change -- lives in exactly one place.
     """
+    routed = _route(layer, hidden_states, router_logits, input_ids)
+    hist = getattr(layer, "expert_hist", None)
+    if hist is not None:
+        ids = routed[1].reshape(-1).long()
+        hist.index_add_(0, ids, torch.ones_like(ids, dtype=hist.dtype))
+    return routed
+
+
+def _route(layer, hidden_states, router_logits, input_ids):
     topk = layer.moe_config.experts_per_token
     simulated = maybe_simulate_routing(hidden_states, router_logits, topk)
     if simulated is not None:
@@ -365,6 +374,12 @@ def register_experts_start_buffer(layer, *, device: torch.device) -> None:
         else None
     )
     layer.register_buffer("_experts_start", buffer, persistent=False)
+    if envs.VLLM_TPU_MOE_EXPERT_HIST > 0:
+        layer.register_buffer(
+            "expert_hist",
+            torch.zeros(layer.global_num_experts, dtype=torch.int32, device=device),
+            persistent=False,
+        )
 
 
 def validate_linear_ep_placement(layer) -> None:
@@ -379,3 +394,18 @@ def validate_linear_ep_placement(layer) -> None:
             "fused MoE kernel currently requires linear EP placement; got "
             f"expert_placement_strategy={strategy!r}."
         )
+
+
+def format_expert_load(name: str, hist: list[int], ep_size: int) -> str:
+    """One line of per-EP-rank load for an expert histogram (contiguous placement)."""
+    total = sum(hist)
+    per = len(hist) // ep_size
+    ranks = [sum(hist[r * per : (r + 1) * per]) for r in range(ep_size)]
+    mean = total / ep_size if ep_size else 0.0
+    hot = max(range(ep_size), key=ranks.__getitem__)
+    top = sorted(range(len(hist)), key=hist.__getitem__, reverse=True)[:3]
+    tops = " ".join(f"e{e}(r{e // per})={hist[e] / max(total, 1):.3f}" for e in top)
+    return (
+        f"moe expert load {name}: picks={total} ranks={ranks} "
+        f"max/mean={max(ranks) / max(mean, 1e-9):.3f} hot=r{hot} top3={tops}"
+    )
