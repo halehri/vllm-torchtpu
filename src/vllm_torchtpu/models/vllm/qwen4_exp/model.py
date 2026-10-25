@@ -666,6 +666,12 @@ class Qwen4ExpBackbone(nn.Module):
         n_mk = getattr(segment_call, "mk_segments", None)
         n_mk = len(qsa_layers) if n_mk is None else int(n_mk)
         ends = qsa_layers[1:] + [len(layers)]
+        # `check_parts` (check mode): each segment also runs its stock layers on
+        # the same input; the stock output continues, and both are returned
+        # stacked [n_seg, T, hc*H] for the driver to compare.
+        check = bool(getattr(segment_call, "check_parts", False))
+        mk_outs: list = []
+        st_outs: list = []
         for s, i in enumerate(qsa_layers):
             layer = layers[i]
             if s >= n_mk:
@@ -688,8 +694,28 @@ class Qwen4ExpBackbone(nn.Module):
                 attention = layer.self_attn.select_for_kernel(block, positions64, metadata)
             else:
                 attention = layer.self_attn.attend(block, positions64, metadata)
+            if check:
+                y_mk = segment_call(s, hidden, attention)
+                for stock in layers[i : ends[s]]:
+                    hidden = stock(
+                        hidden,
+                        positions64,
+                        ids64,
+                        query_start_loc,
+                        ngram_context,
+                        state_slots,
+                        context_lens,
+                        valid_tokens,
+                        main_block_table,
+                        compressed_block_table,
+                    )
+                mk_outs.append(y_mk)
+                st_outs.append(hidden)
+                continue
             hidden = segment_call(s, hidden, attention)
         mixed = self.hyper_connection_mixer.mix(hidden)[0]
+        if check:
+            return mixed, hidden, torch.stack(mk_outs), torch.stack(st_outs)
         if self.emit_mtp_hidden:
             return mixed, hidden
         return mixed

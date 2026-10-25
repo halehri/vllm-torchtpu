@@ -87,6 +87,47 @@ def _parse_int(raw: str, key: str) -> int | None:
     return None
 
 
+def _real_traffic(kw: dict) -> bool:
+    """A served step rather than a warmup dummy: some request has more than 64 tokens of context."""
+    ctx = kw.get("context_lens")
+    if not isinstance(ctx, torch.Tensor) or ctx.numel() == 0:
+        return True
+    return int(ctx.max()) > 64
+
+
+def _stream_stats(mk: torch.Tensor, st: torch.Tensor, valid: torch.Tensor, hc: int, eps: float = 1e-6) -> dict:
+    """Kernel vs stock residual [T, hc*H] over valid rows, as each consumer sees it.
+
+    `rel`: raw; `rel_branch`: each stream RMS-normalized on its own (what the
+    stock hyper-connection mixes see, `hc_per_branch_norm`); `rel_joint`: one RMS
+    norm over all streams (what the MTP draft's `pre_fc_norm_hidden` sees).
+    Per stream: norm ratio |mk|/|stock| and cosine. Per row: raw rel.
+    """
+    a, b = mk.float()[valid], st.float()[valid]
+    if a.shape[0] == 0:
+        return {}
+
+    def rel(x, y):
+        return float((x - y).abs().mean() / y.abs().mean().clamp_min(1e-12))
+
+    def rms(x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+
+    a3, b3 = a.unflatten(-1, (hc, -1)), b.unflatten(-1, (hc, -1))
+    ratio = (a3.norm(dim=-1) / b3.norm(dim=-1).clamp_min(1e-12)).mean(0)
+    cos = torch.nn.functional.cosine_similarity(a3, b3, dim=-1).mean(0)
+    row = (a - b).abs().mean(-1) / b.abs().mean(-1).clamp_min(1e-12)
+    return {
+        "rel": rel(a, b),
+        "rel_branch": rel(rms(a3), rms(b3)),
+        "rel_joint": rel(rms(a), rms(b)),
+        "ratio": [round(float(x), 4) for x in ratio],
+        "cos": [round(float(x), 4) for x in cos],
+        "row_rel": [round(float(x), 3) for x in row[:8]],
+        "nan": int(torch.isnan(a).any(-1).sum()),
+    }
+
+
 # `VLLM_TPU_MEGAKERNEL=...,nodonate=1`: the GDN pool is not donated to the segment op; it
 # writes a fresh pool that `_run` copies back into the live cache (bisecting a served hang).
 NO_DONATE = False
@@ -385,6 +426,8 @@ class Qwen38SegmentDriver:
         self.program = None
         self.check_left = 0
         self.shadow = None
+        self.segcheck_left = 0  # `segcheck=N`: in-program per-segment kernel vs stock on N real steps
+        self.segcheck = None
         self.stats: dict[str, int] = {}
         self.mtp = False
         self.cfg = None
@@ -424,6 +467,7 @@ class Qwen38SegmentDriver:
                 qwen38_segment_call.DEFAULT_RINGS = (int(e), int(d))
         drv = cls(runner, _parse_buckets(raw), head=_parse_flag(raw, "head", True))
         drv.check_left = _parse_check(raw)
+        drv.segcheck_left = _parse_int(raw, "segcheck") or 0
         segs = _parse_int(raw, "segs")
         if segs is not None:
             drv.segments.mk_segments = segs
@@ -518,6 +562,42 @@ class Qwen38SegmentDriver:
                     backbone=runner.model.model,
                     segments=shadow_seg,
                 )
+
+        if self.segcheck_left > 0:
+            # Head layers run stock here (they commit their GDN / PLE state);
+            # segment kernels write no GDN checkpoints, their stock layers do.
+            check_seg = Qwen38Segments(
+                runner.model, self.g, self.mesh, self.buckets, shared=self.segments, head=False
+            )
+            check_seg.bind_pool()
+            check_seg.check_parts = True
+            with self._contexts(runner, "model_mk_segments_segcheck"):
+                self.segcheck = Qwen4ExpSegmentModel(
+                    vllm_config=self.cfg,
+                    prefix="model_mk_segments_segcheck",
+                    backbone=runner.model.model,
+                    segments=check_seg,
+                )
+
+    def _segcheck_step(self, runner: Any, input_ids: Any, positions: Any, kw: dict) -> Any:
+        """Serve the step with the stock layers; log each segment kernel against them."""
+        with self._contexts(runner, "model_mk_segments_segcheck"):
+            mixed, hidden, mk, st = self.segcheck(input_ids=input_ids, positions=positions, **kw)
+        valid = kw.get("valid_tokens")
+        valid = (
+            valid.to(torch.bool)
+            if isinstance(valid, torch.Tensor) and valid.shape[0] == hidden.shape[0]
+            else torch.ones(hidden.shape[0], dtype=torch.bool, device=hidden.device)
+        )
+        hc = runner.model.model.hc_count
+        n = int(valid.sum())
+        for s in range(mk.shape[0]):
+            logger.info(
+                "qwen38 megakernel segcheck seg%d rows=%d %s (%d left)",
+                s, n, _stream_stats(mk[s], st[s], valid, hc), self.segcheck_left - 1,
+            )
+        self.segcheck_left -= 1
+        return (mixed, hidden) if runner.model.model.emit_mtp_hidden else mixed
 
     def _attach_mtp_tail(self, runner: Any) -> None:
         """Route the MTP draft layer's post-attention half to the tail kernel.
@@ -675,7 +755,14 @@ class Qwen38SegmentDriver:
         if first_warm:
             self._tp_barrier("before the first (compiling) call")
         try:
-            if self.check_left > 0 and self.shadow is not None:
+            if (
+                self.segcheck_left > 0
+                and self.segcheck is not None
+                and getattr(runner, "warmup_done", False)
+                and _real_traffic(kw)
+            ):
+                out = self._segcheck_step(runner, input_ids, positions, kw)
+            elif self.check_left > 0 and self.shadow is not None:
                 out = self._shadow_step(runner, input_ids, positions, kw)
             else:
                 with self._contexts(runner, "model_mk_segments"):
@@ -684,7 +771,7 @@ class Qwen38SegmentDriver:
             # Fail closed: one failure disables the megakernel for this server;
             # this step and all later ones run the stock model.
             logger.exception("Qwen3.8 megakernel failed; disabling it, stock path from now on")
-            self.program = self.shadow = None
+            self.program = self.shadow = self.segcheck = None
             return False, None
         if isinstance(out, (list, tuple)):
             out = tuple(out)
