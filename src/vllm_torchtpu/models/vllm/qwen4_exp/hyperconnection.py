@@ -122,6 +122,11 @@ class GatedResidual(common_hc.GatedResidual):
         ):
             return self._prefill_norm_op(hyper_input, self.hc_norm.weight)
 
+        if envs.VLLM_TPU_HC_NORM_GROUPED:
+            values = hyper_input.float().unflatten(-1, (self.hc_count, self.hidden_size))
+            variance = values.square().mean(dim=-1, keepdim=True)
+            output = (values * torch.rsqrt(variance + self.hc_norm.variance_epsilon)).flatten(-2)
+            return (output * (1.0 + self.hc_norm.weight.float())).to(hyper_input.dtype)
         # At prefill sizes, reshaping FP32 [tokens, HC*H] to [tokens, HC, H]
         # changes the TPU layout. Reducing contiguous branches separately
         # keeps the projection-native flat layout and fuses their variance.
