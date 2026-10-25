@@ -339,7 +339,14 @@ class Qwen4ExpAdapter:
         ctx = runner._attn_metadata_builder_ctx
         starts = ctx.query_start_loc
         rows = starts.shape[0] - 1
-        if COMPILED_PREP and snapshot.input_ids.shape[0] == snapshot.num_tokens:
+        # Compiled only on decode / verify steps: a mixed or prefill step's token
+        # count takes many padded shapes, each a lazy compile stall mid-serving
+        # (g06 c8: more 0.2-2 s device-idle mixed steps than the eager control).
+        if (
+            COMPILED_PREP
+            and snapshot.input_ids.shape[0] == snapshot.num_tokens
+            and snapshot.num_tokens <= rows * max(1, self.spec_window)
+        ):
             context, slots, history, valid_tokens = self._prepare_compiled(snapshot, ctx, starts)
             return self._kwargs(snapshot, starts, rows, history, slots, context, valid_tokens)
         context = (ctx.seq_lens - (starts[1:] - starts[:-1])).to(torch.int64)
