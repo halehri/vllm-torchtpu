@@ -63,6 +63,11 @@ def segment_layers(g: Qwen38Geometry, s: int) -> list[int]:
 def _hc_mix_operands(hc: Any, g: Qwen38Geometry) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """`(hdn [W, n_down], [hup_b [k_up, H]])` of one mixing hyper-connection."""
     W, lr = g.NHC * g.H, g.LOWRANK
+    if getattr(hc.input_mix_weight_down, "weight_scale", None) is not None:
+        # TODO: pack (FP8 weight, per-channel scale) into the segment program.
+        raise NotImplementedError(
+            "the Qwen3.8 megakernel needs BF16 HC weights; unset VLLM_TPU_HC_FP8_WEIGHTS"
+        )
     down = hc.input_mix_weight_down.weight.data  # [LR, W]
     inj = hc.block_inject_weight.weight.data  # [NHC, W]
     up = hc.input_mix_weight_up.weight.data  # [W, LR]

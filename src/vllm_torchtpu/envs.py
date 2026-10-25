@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_QWEN4_HC_DECODE_FUSED: bool = False
+    VLLM_TPU_HC_FP8_WEIGHTS: bool = False
     QWEN4_EXP_PREFILL_SP: bool = False
     QWEN4_EXP_PREFILL_SP_MIN_TOKENS: int = 1024
     QWEN4_EXP_PREFILL_SP_MOE: bool = False
@@ -823,6 +824,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gate, branch mean and the combine's injection gate) at <= 512 tokens as
     # one Pallas call, with the attn combine fused ahead of the mlp mix.
     "TPU_QWEN4_HC_DECODE_FUSED": env_bool("TPU_QWEN4_HC_DECODE_FUSED"),
+    # qwen4_exp HC: store the down/up/inject projection weights as FP8 e4m3
+    # with FP32 per-output-channel scales (quantized at load). Decode-sized HC
+    # mixes are bound by these weights' bytes; BF16 activations and FP32
+    # epilogues are unchanged. Disables TPU_QWEN4_HC_DECODE_FUSED.
+    "VLLM_TPU_HC_FP8_WEIGHTS": env_bool("VLLM_TPU_HC_FP8_WEIGHTS"),
     # qwen4_exp: shard prefill-sized steps across TP ranks between attention
     # blocks (reduce-scatter instead of all-reduce), so the hyper-connection
     # streams, PLE gate and residual math run on 1/TP of the tokens. Steps

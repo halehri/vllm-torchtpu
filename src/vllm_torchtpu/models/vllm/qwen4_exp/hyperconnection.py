@@ -29,6 +29,9 @@ class GatedResidual(common_hc.GatedResidual):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        self.fp8_weights = bool(envs.VLLM_TPU_HC_FP8_WEIGHTS)
+        if self.fp8_weights:
+            self._make_fp8_weights()
         if prefill_up_tile and (prefill_up_tile < 128 or prefill_up_tile % 128):
             raise ValueError("HC prefill up tile must be a multiple of 128")
         if prefill_norm_tile and (prefill_norm_tile < 64 or prefill_norm_tile % 64):
@@ -80,6 +83,7 @@ class GatedResidual(common_hc.GatedResidual):
         self._decode_combine_mix_op = None
         if (
             envs.TPU_QWEN4_HC_DECODE_FUSED
+            and not self.fp8_weights
             and self.config.hc_per_branch_norm
             and self.hidden_size % 128 == 0
             and hasattr(self, "input_mix_weight_down")
@@ -109,6 +113,60 @@ class GatedResidual(common_hc.GatedResidual):
             self._prefill_up_op = build_up_epilogue_op(
                 self.hc_count, self.hidden_size, prefill_up_tile
             )
+
+    _PROJECTIONS = ("input_mix_weight_down", "input_mix_weight_up", "block_inject_weight")
+
+    def _make_fp8_weights(self):
+        """VLLM_TPU_HC_FP8_WEIGHTS: store the projection weights as FP8 e4m3 with
+        an FP32 per-output-channel scale, quantized by the weight loader.
+
+        Created at construction (no dtype change after loading). Every read
+        goes through ``_hc_weight`` / ``_hc_linear``, so each graph takes
+        (weight, scale) in the same first-use order on every token bucket.
+        """
+        for name in self._PROJECTIONS:
+            linear = getattr(self, name, None)
+            if linear is None:
+                continue
+            weight = torch.nn.Parameter(
+                torch.empty_like(linear.weight, dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            linear.register_buffer(
+                "weight_scale",
+                torch.ones(linear.weight.shape[0], 1, dtype=torch.float32,
+                           device=linear.weight.device),
+                persistent=False,
+            )
+
+            def loader(param, loaded, linear=linear):
+                w = loaded.detach().to("cpu", torch.float32)
+                scale = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / 448.0
+                q = (w / scale).to(torch.float8_e4m3fn)
+                param.data.copy_(q.to(param.device))
+                linear.weight_scale.copy_(scale.to(linear.weight_scale.device))
+
+            weight.weight_loader = loader
+            linear.weight = weight
+
+    def _hc_weight(self, name):
+        """A projection weight in BF16 (dequantized under FP8 weights)."""
+        linear = getattr(self, name)
+        scale = getattr(linear, "weight_scale", None)
+        if scale is None:
+            return linear.weight
+        return (linear.weight.to(torch.float32) * scale).to(torch.bfloat16)
+
+    def _hc_linear(self, x, name):
+        """``F.linear(x, weight)``; under FP8 weights the e4m3 -> BF16 convert
+        feeds the dot (exact: e4m3 values are BF16 values) and the per-output
+        scale is applied to the result."""
+        linear = getattr(self, name)
+        scale = getattr(linear, "weight_scale", None)
+        if scale is None:
+            return F.linear(x, linear.weight)
+        out = F.linear(x, linear.weight.to(x.dtype))
+        return (out.float() * scale.reshape(-1)).to(x.dtype)
 
     def _normalize(self, hyper_input):
         if not self.config.hc_per_branch_norm:
@@ -179,7 +237,7 @@ class GatedResidual(common_hc.GatedResidual):
         """
         if not hasattr(self, "block_inject_weight"):
             return hyper_input, norm
-        injection = F.linear(norm, self.block_inject_weight.weight)
+        injection = self._hc_linear(norm, "block_inject_weight")
         return hyper_input, 2.0 * torch.sigmoid(injection.float() / self.hc_count)
 
     def mix(self, hyper_input):
@@ -202,18 +260,23 @@ class GatedResidual(common_hc.GatedResidual):
             and hyper_input.shape[0] % (2 * self.prefill_full_tile) == 0
             and hyper_input.dtype == torch.bfloat16
             and self.hc_norm.weight.dtype == torch.bfloat16
-            and self.input_mix_weight_down.weight.dtype == torch.bfloat16
-            and self.input_mix_weight_up.weight.dtype == torch.bfloat16
+            and (
+                self.fp8_weights
+                or (
+                    self.input_mix_weight_down.weight.dtype == torch.bfloat16
+                    and self.input_mix_weight_up.weight.dtype == torch.bfloat16
+                )
+            )
         ):
             mixed, norm = self._prefill_full_op(
                 hyper_input,
                 self.hc_norm.weight,
-                self.input_mix_weight_down.weight,
-                self.input_mix_weight_up.weight,
+                self._hc_weight("input_mix_weight_down"),
+                self._hc_weight("input_mix_weight_up"),
             )
             return mixed, self._residual(hyper_input, norm)
         norm = self._normalize(hyper_input)
-        gate = F.linear(norm, self.input_mix_weight_down.weight) / self.hc_count
+        gate = self._hc_linear(norm, "input_mix_weight_down") / self.hc_count
         # TorchTPU can lower BF16 SiLU through BF16 logistic/tanh, rounding
         # negative tails to zero. Compute the activation in FP32 and round
         # once, matching NVIDIA hc_silu's BF16 result boundary.
@@ -224,11 +287,14 @@ class GatedResidual(common_hc.GatedResidual):
             and gate.shape[0] % self.prefill_up_tile == 0
             and gate.dtype == torch.bfloat16
             and norm.dtype == torch.bfloat16
-            and self.input_mix_weight_up.weight.dtype == torch.bfloat16
+            and (
+                self.fp8_weights
+                or self.input_mix_weight_up.weight.dtype == torch.bfloat16
+            )
         ):
-            mixed = self._prefill_up_op(gate, norm, self.input_mix_weight_up.weight)
+            mixed = self._prefill_up_op(gate, norm, self._hc_weight("input_mix_weight_up"))
             return mixed, self._residual(hyper_input, norm)
-        gate = F.linear(gate, self.input_mix_weight_up.weight)
+        gate = self._hc_linear(gate, "input_mix_weight_up")
         gate = torch.sigmoid(gate.float()).unflatten(
             -1, (self.hc_count, self.hidden_size)
         )
@@ -254,7 +320,7 @@ class GatedResidual(common_hc.GatedResidual):
             # The fused decode mix already produced the injection gate.
             injection = hyper_input_normed
         else:
-            injection = F.linear(hyper_input_normed, self.block_inject_weight.weight)
+            injection = self._hc_linear(hyper_input_normed, "block_inject_weight")
             injection = 2.0 * torch.sigmoid(injection.float() / self.hc_count)
         if (
             self._prefill_combine_op is not None
