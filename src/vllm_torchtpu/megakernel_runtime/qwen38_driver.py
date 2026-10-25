@@ -809,9 +809,10 @@ class Qwen38SegmentDriver:
             if self.mk_calls <= 2:
                 self._log_gdn_meta()
         kw = dict(model_kwargs or {})
-        if self.check_left > 0 and not _real_traffic(kw):
+        if self.check_left > 0 and not (getattr(runner, "warmup_done", False) and _real_traffic(kw)):
             # Check mode only spends its checks on real requests: warmup's dummy
-            # steps (contexts of a few tokens) carry garbage rows on both paths.
+            # steps and spec-decode warmup requests run over an uninitialised
+            # pool and carry garbage rows on both paths.
             self._note("check_skip_warmup")
             return False, None
         first_warm = self.warm and self.mk_calls == 1
