@@ -89,9 +89,9 @@ def _prepare_device_inputs(
     Run eagerly, its ~40 small ops are as many device programs per step (where /
     gather / index_copy / cat / sub / lt ... in the Perfetto trace); compiled, one.
     `row_start` / `num_requests` are 0-d int64 tensors so the step's values do not
-    specialise the program. With `spec_window`, `current`'s three record buffers are
-    written in place (`index_copy_`), as `_speculative_ngram_context` does.
-    Returns `(context, slots, history, valid_tokens)`.
+    specialise the program. With `spec_window`, `current`'s three record buffers come
+    back updated (what `_speculative_ngram_context` writes in place).
+    Returns `(context, slots, history, valid_tokens, current)`.
     """
     rows = starts.shape[0] - 1
     context = (seq_lens - (starts[1:] - starts[:-1])).to(torch.int64)
@@ -110,11 +110,16 @@ def _prepare_device_inputs(
         chunk = ids[(starts[:-1, None].to(torch.int64) + offsets).clamp(0, ids.shape[0] - 1)]
         target = torch.where(valid_rows, arange_rows + row_start, tokens.shape[0] - 1)
         lengths_now = (starts[1:] - starts[:-1]).to(torch.int64)
-        tokens.index_copy_(0, target, torch.cat([history, chunk], dim=1))
-        recent_context.index_copy_(0, target, context)
-        lengths.index_copy_(0, target, lengths_now.clamp(max=spec_window))
+        # Functional updates: an in-place index_copy_ on a compiled program's input is
+        # written back by separate eager copy_ programs (census g04: 3 copy_ + an
+        # as_strided per step); the caller swaps the returned buffers in instead.
+        current = (
+            tokens.index_copy(0, target, torch.cat([history, chunk], dim=1)),
+            recent_context.index_copy(0, target, context),
+            lengths.index_copy(0, target, lengths_now.clamp(max=spec_window)),
+        )
     valid_tokens = torch.arange(input_ids.shape[0], device=starts.device) < starts[-1]
-    return context, slots, history, valid_tokens
+    return context, slots, history, valid_tokens, current
 
 
 # QWEN4_EXP_COMPILED_PREP=0 keeps the eager path (same-image A/B control).
@@ -308,7 +313,7 @@ class Qwen4ExpAdapter:
         scalars = torch.tensor(
             [snapshot.row_start, snapshot.num_requests], dtype=torch.int64
         ).to(device, non_blocking=True)
-        return _prepare_device_inputs_compiled(
+        context, slots, history, valid_tokens, updated = _prepare_device_inputs_compiled(
             snapshot.token_store,
             ctx.seq_lens,
             starts,
@@ -324,6 +329,9 @@ class Qwen4ExpAdapter:
             spec_window=self.spec_window,
             pooled=self.pooled,
         )
+        if self.spec_window:
+            self._recent[1] = updated  # this step's record (the list holds (previous, current))
+        return context, slots, history, valid_tokens
 
     def prepare_inputs(self, snapshot):
         runner = self.runner
