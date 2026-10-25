@@ -98,12 +98,30 @@ def wait_for_peer_artifact(timeout_s: float):
         _peer_wait.timeout_s = 0.0
 
 
+# Custom ops that read the TP rank inside their implementation, so the rank
+# becomes a constant of the lowered program without showing in the graph code.
+# vLLM's sequence_parallel_chunk slices this rank's rows at tp_rank * chunk.
+_RANK_DEPENDENT_OPS = ("sequence_parallel_chunk",)
+
+
+def _tp_rank() -> int:
+    from vllm.distributed import (
+        get_tensor_model_parallel_rank,
+        model_parallel_is_initialized,
+    )
+
+    return get_tensor_model_parallel_rank() if model_parallel_is_initialized() else 0
+
+
 def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
     """Hash of the code of `graph` and its submodules and of their constants.
 
     Two ranks with the same fingerprint traced the same program, so either can
     replay the other's artifact. A rank-dependent value baked into the graph,
     e.g. a Python int from `rank_in_group`, changes the code and so the hash.
+    A custom op that reads the rank inside its implementation does not, so a
+    graph calling one is hashed with this rank too: its executable takes this
+    rank's rows, and another rank replaying it would take them as well.
     None if the graph cannot be hashed; its artifact is then only replayed by
     the rank that saved it.
     """
@@ -114,6 +132,10 @@ def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
                 continue
             h.update(f"{name}\n{module.code}".encode())
             for node in module.graph.nodes:
+                if node.op == "call_function" and any(
+                    op in str(node.target) for op in _RANK_DEPENDENT_OPS
+                ):
+                    h.update(f"tp_rank={_tp_rank()}".encode())
                 if node.op != "get_attr":
                     continue
                 value = module

@@ -731,3 +731,34 @@ class TestTpuCompilerCache:
         assert not os.path.samefile(path, os.path.join(a.cache_dir, key))
         with open(path, "rb") as f:
             assert pickle.load(f).fingerprint is None
+
+
+def _fingerprint_at_rank(monkeypatch, fn, rank):
+    from torch import fx
+
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    monkeypatch.setattr(tpu_compiler, "_tp_rank", lambda: rank)
+    return tpu_compiler._graph_fingerprint(fx.symbolic_trace(fn))
+
+
+def test_a_graph_slicing_this_ranks_rows_is_never_replayed_by_another_rank(
+    monkeypatch,
+):
+    # sequence_parallel_chunk reads the TP rank inside the op: the graph code
+    # is the same on every rank, the lowered program is not.
+    import torch
+    import vllm.model_executor.models.utils  # noqa: F401  registers the op
+
+    def sharded(x):
+        return torch.ops.vllm.sequence_parallel_chunk_impl(x) * 2
+
+    def replicated(x):
+        return x * 2
+
+    assert _fingerprint_at_rank(monkeypatch, sharded, 0) != _fingerprint_at_rank(
+        monkeypatch, sharded, 1
+    )
+    assert _fingerprint_at_rank(monkeypatch, replicated, 0) == _fingerprint_at_rank(
+        monkeypatch, replicated, 1
+    )
