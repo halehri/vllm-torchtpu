@@ -32,6 +32,12 @@ from ...decls import (
 from ...exec_spec import ExecSpec
 from ...fused_io_hook import fused_io
 from ...ops import BF16, F32, FP8, I32, rup
+
+# Dtype of the recurrent state carried between tokens and of its per-token
+# checkpoints. F32 like the stock GDN: a bf16 carry rounds the state after
+# every token and compounds over a request's decode steps on the heads that
+# barely decay (exp(g) ~ 1), up to ~15% state error over 8k steps.
+REC_DTYPE = F32
 from ...pool.config import cache_exec
 from ...spec import Block, SmallField, StateDecl, WeightDecl
 from .conv import conv_step, gdn_in
@@ -196,7 +202,7 @@ class GDNBlock(Block):
         return [
             StateDecl("conv", shape=conv_shape, dtype=F32, access="rw"),
             StateDecl(
-                "rec", shape=(ex.NS * lay.vh, lay.KD, lay.VD), dtype=BF16, access="rw"
+                "rec", shape=(ex.NS * lay.vh, lay.KD, lay.VD), dtype=REC_DTYPE, access="rw"
             ),
         ]
 
@@ -215,14 +221,14 @@ class GDNBlock(Block):
                 StateDecl(
                     "rec_ckpt",
                     shape=(ex.B * lay.vh, lay.KD, lay.VD),
-                    dtype=BF16,
+                    dtype=REC_DTYPE,
                     access="w",
                 ),
             ]
         return [
             StateDecl("conv", shape=(rup(3 * ex.B, 8), lay.QKV), dtype=F32, access="w"),
             StateDecl(
-                "rec", shape=(ex.B * lay.vh, lay.KD, lay.VD), dtype=BF16, access="w"
+                "rec", shape=(ex.B * lay.vh, lay.KD, lay.VD), dtype=REC_DTYPE, access="w"
             ),
         ]
 
@@ -251,9 +257,9 @@ class GDNBlock(Block):
             return fused_io().gdn_fused_scratch(ex, gp, plan)
         scr: dict[str, Any] = {
             "recb": (
-                pltpu.VMEM((gp.NRB, gp.CBV, gp.KD, gp.VD), BF16)
+                pltpu.VMEM((gp.NRB, gp.CBV, gp.KD, gp.VD), REC_DTYPE)
                 if gp.GCH
-                else pltpu.VMEM((ex.B * gp.vh, gp.KD, gp.VD), BF16)
+                else pltpu.VMEM((ex.B * gp.vh, gp.KD, gp.VD), REC_DTYPE)
             ),
             "sbuf": pltpu.VMEM((gp.vh, gp.KD, gp.VD), F32),
             "convb": pltpu.VMEM(
