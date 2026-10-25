@@ -509,6 +509,10 @@ class Qwen38SegmentDriver:
                 head=bool(self.segments.head_groups),
             )
             shadow_seg.bind_pool()
+            # segs= applies to the shadow program too, so check mode can localize a
+            # wrong kernel kind segment by segment.
+            if getattr(self.segments, "mk_segments", None) is not None:
+                shadow_seg.mk_segments = self.segments.mk_segments
             with self._contexts(runner, "model_mk_segments_shadow"):
                 self.shadow = Qwen4ExpSegmentModel(
                     vllm_config=self.cfg,
