@@ -268,9 +268,14 @@ class GatedResidual(common_hc.GatedResidual):
                 )
             )
         ):
+            norm_weight = self.hc_norm.weight
+            if self.fp8_weights:
+                # Use the norm weight before the dequantizing multiplies, so
+                # this subgraph takes its inputs in the decode buckets' order.
+                norm_weight = norm_weight.reshape(-1)
             mixed, norm = self._prefill_full_op(
                 hyper_input,
-                self.hc_norm.weight,
+                norm_weight,
                 self._hc_weight("input_mix_weight_down"),
                 self._hc_weight("input_mix_weight_up"),
             )
