@@ -148,6 +148,20 @@ def _pallas_tp_mesh(runner: Any) -> Any:
     return _build_tp_rank_mesh(8, getattr(runner, "mesh", None))
 
 
+def _compare_rows(a: torch.Tensor, b: torch.Tensor, valid: torch.Tensor) -> dict:
+    """`a` vs reference `b` over valid rows: NaN rows per side, rel / max_abs over rows finite on both."""
+    a32, b32 = a.float(), b.float()
+    na, nb = torch.isnan(a32).any(-1) & valid, torch.isnan(b32).any(-1) & valid
+    ok = valid & ~na & ~nb
+    if int(ok.sum()) == 0:
+        rel = max_abs = float("nan")
+    else:
+        d = (a32 - b32).abs()[ok]
+        rel = float(d.mean() / b32.abs()[ok].mean().clamp_min(1e-6))
+        max_abs = float(d.max())
+    return {"valid": int(valid.sum()), "nan_a": int(na.sum()), "nan_b": int(nb.sum()), "rel": rel, "max_abs": max_abs}
+
+
 def pool_layout_of(pool: torch.Tensor) -> Any:
     """`Qwen38GdnPoolLayout` of a torch pool tensor (shape and dtype name only)."""
     from .qwen38_gdn_state import Qwen38GdnPoolLayout
@@ -386,6 +400,7 @@ class Qwen38SegmentDriver:
         self.stats: dict[str, int] = {}
         self.mtp = False
         self.cfg = None
+        self.parts_left = 0  # `checkparts=N`: per-component eager comparison on N steps
         self.seq = 0  # try_forward calls, to compare the step sequence across ranks
         self.mk_calls = 0
         self.sync = False  # `sync=1`: wait for the first calls' outputs and log it (bisecting)
@@ -422,6 +437,7 @@ class Qwen38SegmentDriver:
                 qwen38_segment_call.DEFAULT_RINGS = (int(e), int(d))
         drv = cls(runner, _parse_buckets(raw), head=_parse_flag(raw, "head", True))
         drv.check_left = _parse_check(raw)
+        drv.parts_left = _parse_int(raw, "checkparts") or 0
         segs = _parse_int(raw, "segs")
         if segs is not None:
             drv.segments.mk_segments = segs
@@ -557,22 +573,112 @@ class Qwen38SegmentDriver:
         stock = runner.model(input_ids=input_ids, positions=positions, **kw)
         mk_h = mk[0] if isinstance(mk, (tuple, list)) else mk
         st_h = stock[0] if isinstance(stock, (tuple, list)) else stock
-        d = (mk_h.float() - st_h.float()).abs()
-        rel = float(d.mean() / st_h.float().abs().mean().clamp_min(1e-6))
+        valid = kw.get("valid_tokens")
+        valid = (
+            valid.to(torch.bool)
+            if isinstance(valid, torch.Tensor) and valid.shape[0] == mk_h.shape[0]
+            else torch.ones(mk_h.shape[0], dtype=torch.bool, device=mk_h.device)
+        )
+        stats = _compare_rows(mk_h, st_h, valid)
         top_mk = runner.model.compute_logits(mk_h).argmax(-1)
         top_st = runner.model.compute_logits(st_h).argmax(-1)
-        agree = float((top_mk == top_st).float().mean())
+        ok = valid & ~torch.isnan(mk_h.float()).any(-1) & ~torch.isnan(st_h.float()).any(-1)
+        agree = float(((top_mk == top_st) & ok).sum() / ok.sum().clamp_min(1))
         logger.info(
             "qwen38 megakernel shadow check rows=%d mean_rel=%.4g max_abs=%.4g "
-            "top1_agree=%.4f (%d left)",
+            "top1_agree=%.4f valid=%d nan_mk=%d nan_stock=%d (%d left)",
             int(input_ids.shape[0]),
-            rel,
-            float(d.max()),
+            stats["rel"],
+            stats["max_abs"],
             agree,
+            stats["valid"],
+            stats["nan_a"],
+            stats["nan_b"],
             self.check_left - 1,
         )
         self.check_left -= 1
         return stock
+
+    def _component_check(self, runner: Any, input_ids: Any, positions: Any, kw: dict) -> None:
+        """Per-component kernel vs stock on the same input and state (eager, logged).
+
+        Follows `forward_segments`: embed, each head group (kernel after the
+        group's PLE vs the group's stock layers), then each segment (HC mix and
+        stock attention, then the segment kernel vs the segment's stock layers).
+        Every component starts from the stock output of the previous one, so a
+        wrong component shows up alone. Kernel calls use the shadow segments (no
+        GDN checkpoint writes) and run before the stock layers of the same
+        component, so both read the same GDN state.
+        """
+        from vllm_torchtpu.models.vllm.qwen4_exp.qsa import QSAMetadata
+
+        bb = runner.model.model
+        seg = self.shadow.segments if self.shadow is not None else self.segments
+        layers = bb.layers
+        pos64, ids64 = positions.to(torch.int64), input_ids.to(torch.int64)
+        valid = kw["valid_tokens"].to(torch.bool)
+        args = (
+            pos64,
+            ids64,
+            kw["query_start_loc"],
+            kw["ngram_context"],
+            kw["state_slots"],
+            kw["context_lens"],
+            kw["valid_tokens"],
+            kw["main_block_table"],
+            kw["compressed_block_table"],
+        )
+
+        def stock(x: Any, ids: Any) -> Any:
+            for i in ids:
+                x = layers[i](x, *args)
+            return x
+
+        rows = []
+
+        def cmp(name: str, a: Any, b: Any) -> None:
+            st = _compare_rows(a, b, valid)
+            rows.append((name, st))
+            logger.info(
+                "qwen38 megakernel component %s: valid=%d nan_mk=%d nan_stock=%d rel=%.4g max_abs=%.4g",
+                name, st["valid"], st["nan_a"], st["nan_b"], st["rel"], st["max_abs"],
+            )
+
+        qsa = [i for i, layer in enumerate(layers) if layer.layer_type == "full_attention"]
+        with torch.no_grad():
+            x = bb.embed_tokens(input_ids).repeat(1, bb.hc_count)
+            cmp("embed", x, x)  # sanity: valid count, NaN in the embedding itself
+            if seg.head_groups:
+                for h, group in enumerate(seg.head_groups):
+                    xp = layers[group[0]].apply_ple(
+                        x, ids64, kw["query_start_loc"], kw["ngram_context"],
+                        kw["state_slots"], kw["context_lens"],
+                    )
+                    y_mk = seg.head(h, xp)
+                    y_st = stock(x, group)
+                    cmp(f"head{h}[L{group[0]}-{group[-1]}]", y_mk, y_st)
+                    x = y_st
+            else:
+                x = stock(x, range(qsa[0]))
+            meta = QSAMetadata(
+                kw["query_start_loc"], kw["context_lens"], kw["state_slots"],
+                kw["main_block_table"], kw["compressed_block_table"],
+            )
+            for s_i, q in enumerate(qsa):
+                ids = segment_layers(self.g, s_i)
+                block, _ = layers[q].attn_hyper_connection.mix(x)
+                att = layers[q].self_attn.attend(block, pos64, meta)
+                y_mk = seg(s_i, x, att)
+                y_st = stock(x, ids)
+                cmp(f"seg{s_i}[L{ids[0]}-{ids[-1]}]", y_mk, y_st)
+                x = y_st
+        first_nan = next((n for n, st in rows if st["nan_a"] or st["nan_b"]), "none")
+        first_bad = next((n for n, st in rows if st["rel"] > 0.05), "none")
+        logger.info(
+            "qwen38 megakernel component summary: first_nan=%s first_rel_over_0.05=%s (%d left)",
+            first_nan, first_bad, self.parts_left - 1,
+        )
+        self.parts_left -= 1
 
     def _tp_barrier(self, what: str) -> None:
         import time
@@ -674,6 +780,12 @@ class Qwen38SegmentDriver:
         if first_warm:
             self._tp_barrier("before the first (compiling) call")
         try:
+            if self.parts_left > 0 and self.check_left > 0:
+                try:
+                    self._component_check(runner, input_ids, positions, kw)
+                except Exception:
+                    logger.exception("qwen38 megakernel component check failed")
+                    self.parts_left = 0
             if self.check_left > 0 and self.shadow is not None:
                 out = self._shadow_step(runner, input_ids, positions, kw)
             else:
