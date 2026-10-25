@@ -2,6 +2,7 @@
 """One reordered token snapshot and shared GDN/QSA/PLE ragged geometry."""
 
 import math
+import os
 import time
 from typing import TYPE_CHECKING, cast
 
@@ -64,6 +65,65 @@ def merge_recent_ngram_context(
     )
     gathered = torch.gather(tokens, 1, index.clamp(0, tokens.shape[1] - 1))
     return torch.where(usable, gathered, history)
+
+
+def _prepare_device_inputs(
+    token_store,
+    seq_lens,
+    starts,
+    row_start,
+    num_requests,
+    state_indices,
+    previous_rows,
+    previous,
+    current,
+    input_ids,
+    *,
+    eos_token_id: int,
+    ngram_size: int,
+    spec_window: int,
+    pooled: bool,
+):
+    """The device math of `Qwen4ExpAdapter.prepare_inputs` as one function.
+
+    Run eagerly, its ~40 small ops are as many device programs per step (where /
+    gather / index_copy / cat / sub / lt ... in the Perfetto trace); compiled, one.
+    `row_start` / `num_requests` are 0-d int64 tensors so the step's values do not
+    specialise the program. With `spec_window`, `current`'s three record buffers are
+    written in place (`index_copy_`), as `_speculative_ngram_context` does.
+    Returns `(context, slots, history, valid_tokens)`.
+    """
+    rows = starts.shape[0] - 1
+    context = (seq_lens - (starts[1:] - starts[:-1])).to(torch.int64)
+    arange_rows = torch.arange(rows, dtype=torch.int64, device=starts.device)
+    valid_rows = arange_rows < num_requests
+    if pooled:
+        state_indices = arange_rows.to(torch.int32)
+    slots = torch.where(valid_rows, state_indices, -1).to(torch.int32)
+    row_ids = (arange_rows + row_start).clamp(max=token_store.shape[0] - 1)
+    history = ngram_context_from_store(token_store, row_ids, context, eos_token_id, ngram_size)
+    if spec_window:
+        history = merge_recent_ngram_context(history, *previous, previous_rows, context)
+        tokens, recent_context, lengths = current
+        ids = input_ids.to(torch.int64)
+        offsets = torch.arange(spec_window, device=ids.device)
+        chunk = ids[(starts[:-1, None].to(torch.int64) + offsets).clamp(0, ids.shape[0] - 1)]
+        target = torch.where(valid_rows, arange_rows + row_start, tokens.shape[0] - 1)
+        lengths_now = (starts[1:] - starts[:-1]).to(torch.int64)
+        tokens.index_copy_(0, target, torch.cat([history, chunk], dim=1))
+        recent_context.index_copy_(0, target, context)
+        lengths.index_copy_(0, target, lengths_now.clamp(max=spec_window))
+    valid_tokens = torch.arange(input_ids.shape[0], device=starts.device) < starts[-1]
+    return context, slots, history, valid_tokens
+
+
+# QWEN4_EXP_COMPILED_PREP=0 keeps the eager path (same-image A/B control).
+COMPILED_PREP = os.environ.get("QWEN4_EXP_COMPILED_PREP", "1").strip().lower() not in (
+    "0", "false", "off", "no"
+)
+_prepare_device_inputs_compiled = torch.compile(
+    _prepare_device_inputs, backend="tpu", fullgraph=True, dynamic=False
+)
 
 
 def dummy_query_lengths(num_tokens, num_reqs, max_active):
@@ -229,11 +289,50 @@ class Qwen4ExpAdapter:
         lengths.index_copy_(0, target, lengths_now.clamp(max=self.spec_window))
         return history
 
+    def _prepare_compiled(self, snapshot, ctx, starts):
+        """`prepare_inputs`' device math in one compiled program (see `_prepare_device_inputs`)."""
+        runner = self.runner
+        rows = starts.shape[0] - 1
+        device = runner.device
+        previous_rows = None
+        previous = current = None
+        if self.spec_window:
+            req_ids = runner.input_batch.req_ids
+            previous_np = torch.full((rows,), -1, dtype=torch.int64)
+            for i in range(snapshot.num_requests):
+                req_id = req_ids[snapshot.row_start + i]
+                previous_np[i] = self._previous_rows.get(req_id, -1)
+                self._current_rows[req_id] = snapshot.row_start + i
+            previous_rows = previous_np.to(device, non_blocking=True)
+            previous, current = self._recent_buffers(device)
+        scalars = torch.tensor(
+            [snapshot.row_start, snapshot.num_requests], dtype=torch.int64
+        ).to(device, non_blocking=True)
+        return _prepare_device_inputs_compiled(
+            snapshot.token_store,
+            ctx.seq_lens,
+            starts,
+            scalars[0],
+            scalars[1],
+            None if self.pooled else ctx.mamba_state_indices,
+            previous_rows,
+            previous,
+            current,
+            snapshot.input_ids,
+            eos_token_id=self.config.eos_token_id,
+            ngram_size=self.config.ngram_size,
+            spec_window=self.spec_window,
+            pooled=self.pooled,
+        )
+
     def prepare_inputs(self, snapshot):
         runner = self.runner
         ctx = runner._attn_metadata_builder_ctx
         starts = ctx.query_start_loc
         rows = starts.shape[0] - 1
+        if COMPILED_PREP and snapshot.input_ids.shape[0] == snapshot.num_tokens:
+            context, slots, history, valid_tokens = self._prepare_compiled(snapshot, ctx, starts)
+            return self._kwargs(snapshot, starts, rows, history, slots, context, valid_tokens)
         context = (ctx.seq_lens - (starts[1:] - starts[:-1])).to(torch.int64)
         valid_rows = torch.arange(rows, device=runner.device) < snapshot.num_requests
         state_indices = (
@@ -258,6 +357,10 @@ class Qwen4ExpAdapter:
             history = self._speculative_ngram_context(
                 snapshot, history, context, starts
             )
+        valid_tokens = torch.arange(snapshot.num_tokens, device=runner.device) < starts[-1]
+        return self._kwargs(snapshot, starts, rows, history, slots, context, valid_tokens)
+
+    def _kwargs(self, snapshot, starts, rows, history, slots, context, valid_tokens):
         tables = []
         attention = f"{self.attention_prefix}.self_attn"
         for name in (self._main_owner(attention), self._compressed_owner(attention)):
@@ -269,8 +372,7 @@ class Qwen4ExpAdapter:
             ngram_context=history,
             state_slots=slots,
             context_lens=context,
-            valid_tokens=torch.arange(snapshot.num_tokens, device=runner.device)
-            < starts[-1],
+            valid_tokens=valid_tokens,
             main_block_table=tables[0],
             compressed_block_table=tables[1],
         )
