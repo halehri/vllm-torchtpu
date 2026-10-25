@@ -429,6 +429,8 @@ class Qwen38SegmentDriver:
         self.segcheck_left = 0  # `segcheck=N`: in-program per-segment kernel vs stock on N real steps
         self.segstock = False
         self.seghead = False
+        self.segdump = False  # `segdump=1`: torch.save the first check step (ranks 0, 3)
+        self.segcheck_dumped = 0
         self.segcheck = None
         self.stats: dict[str, int] = {}
         self.mtp = False
@@ -474,6 +476,7 @@ class Qwen38SegmentDriver:
         # the GDN pool only ever holds checkpoints the stock layers wrote.
         drv.segstock = _parse_flag(raw, "segstock", False)
         drv.seghead = _parse_flag(raw, "seghead", False)
+        drv.segdump = _parse_flag(raw, "segdump", False)
         segs = _parse_int(raw, "segs")
         if segs is not None:
             drv.segments.mk_segments = segs
@@ -592,7 +595,9 @@ class Qwen38SegmentDriver:
     def _segcheck_step(self, runner: Any, input_ids: Any, positions: Any, kw: dict) -> Any:
         """Serve the step with the stock layers; log each segment kernel against them."""
         with self._contexts(runner, "model_mk_segments_segcheck"):
-            mixed, hidden, mk, st = self.segcheck(input_ids=input_ids, positions=positions, **kw)
+            mixed, hidden, mk, st, mixed_chain, chain, seg0_in, att0 = self.segcheck(
+                input_ids=input_ids, positions=positions, **kw
+            )
         valid = kw.get("valid_tokens")
         valid = (
             valid.to(torch.bool)
@@ -608,8 +613,67 @@ class Qwen38SegmentDriver:
                 "qwen38 megakernel segcheck %s rows=%d %s (%d left)",
                 name, n, _stream_stats(mk[s], st[s], valid, hc), self.segcheck_left - 1,
             )
+        # The full kernel chain from the stock seg0 input: the hidden state MK
+        # serving hands to the MTP draft, and the target's top-1 from it.
+        top_mk = runner.model.compute_logits(mixed_chain).argmax(-1)
+        top_st = runner.model.compute_logits(mixed).argmax(-1)
+        agree = float(((top_mk == top_st) & valid).sum()) / max(n, 1)
+        logger.info(
+            "qwen38 megakernel segcheck chain rows=%d hidden %s mixed_rel=%.4g top1_agree=%.4f",
+            n, _stream_stats(chain, hidden, valid, hc),
+            _stream_stats(mixed_chain, mixed, valid, 1).get("rel", float("nan")), agree,
+        )
+        if self.segdump and self.segcheck_dumped < 1:
+            self._segdump(runner, input_ids, positions, kw, {
+                "mixed": mixed, "hidden": hidden, "mixed_chain": mixed_chain, "chain": chain,
+                "seg0_in": seg0_in, "att0": att0, "seg0_mk": mk[n_head], "seg0_st": st[n_head],
+                "top_mk": top_mk, "top_st": top_st,
+            })
+            self.segcheck_dumped += 1
         self.segcheck_left -= 1
         return (mixed, hidden) if runner.model.model.emit_mtp_hidden else mixed
+
+    def _segdump(self, runner: Any, input_ids: Any, positions: Any, kw: dict, outs: dict) -> None:
+        """torch.save one check step (ranks 0 and 3): inputs, metadata, seg0 GDN reads."""
+        import os
+
+        import torch.distributed as dist
+        from vllm.forward_context import get_forward_context
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank not in (0, 3):
+            return
+        cpu = lambda t: t.detach().to("cpu") if isinstance(t, torch.Tensor) else t  # noqa: E731
+        rec: dict = {k: cpu(v) for k, v in outs.items()}
+        rec["input_ids"], rec["positions"] = cpu(input_ids), cpu(positions)
+        rec["kw"] = {k: cpu(v) for k, v in kw.items() if isinstance(v, torch.Tensor)}
+        md_all = get_forward_context().attn_metadata
+        layers = self.segments.layers
+        ids = segment_layers(self.g, 0)[1:] + [i for g in self.segments.head_groups for i in g]
+        meta, reads = {}, {}
+        pool = self.segments.pool
+        for i in ids:
+            md = md_all[layers[i].linear_attn.prefix]
+            f = {
+                k: cpu(getattr(md, k, None))
+                for k in ("mamba_state_indices", "mamba_ckpt_indices", "query_start_loc",
+                          "seq_lens", "mamba_request_distribution")
+            }
+            st_idx = md.mamba_state_indices.to(torch.int64)
+            off = md.mamba_slot_read_offsets.to(torch.int64)[st_idx]
+            f["read_offset"] = cpu(off)
+            ck = md.mamba_ckpt_indices.to(torch.int64)
+            rb = ck[torch.arange(ck.shape[0], device=ck.device), off.clamp(0, ck.shape[1] - 1)]
+            f["read_block"] = cpu(rb)
+            meta[i] = f
+            n_live = int((md.query_start_loc[1:] - md.query_start_loc[:-1] > 0).sum())
+            reads[i] = torch.stack([cpu(pool[int(b) * 4 : int(b) * 4 + 4]) for b in rb[:n_live].tolist()]) if n_live else None
+        rec["gdn_meta"], rec["gdn_read_rows"] = meta, reads
+        out_dir = os.path.join(os.environ.get("CDK_OUTPUT_DIR", "/tmp"), "mkdump")
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"rank{rank}_seq{self.seq}.pt")
+        torch.save(rec, path)
+        logger.info("qwen38 megakernel segdump wrote %s", path)
 
     def _attach_mtp_tail(self, runner: Any) -> None:
         """Route the MTP draft layer's post-attention half to the tail kernel.

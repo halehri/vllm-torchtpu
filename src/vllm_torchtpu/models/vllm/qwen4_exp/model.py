@@ -720,7 +720,13 @@ class Qwen4ExpBackbone(nn.Module):
             else:
                 attention = layer.self_attn.attend(block, positions64, metadata)
             if check:
+                if s == 0:
+                    chain, seg0_in, att0 = hidden, hidden, attention
                 y_mk = segment_call(s, hidden, attention)
+                # The kernel chain on its own input (what MK serving computes), before
+                # the stock layers so their cache writes are the last ones.
+                c_block, _ = layer.attn_hyper_connection.mix(chain)
+                chain = segment_call(s, chain, layer.self_attn.attend(c_block, positions64, metadata))
                 for stock in layers[i : ends[s]]:
                     hidden = stock(
                         hidden,
@@ -740,7 +746,11 @@ class Qwen4ExpBackbone(nn.Module):
             hidden = segment_call(s, hidden, attention)
         mixed = self.hyper_connection_mixer.mix(hidden)[0]
         if check:
-            return mixed, hidden, torch.stack(mk_outs), torch.stack(st_outs)
+            mixed_chain = self.hyper_connection_mixer.mix(chain)[0]
+            return (
+                mixed, hidden, torch.stack(mk_outs), torch.stack(st_outs),
+                mixed_chain, chain, seg0_in, att0,
+            )
         if self.emit_mtp_hidden:
             return mixed, hidden
         return mixed
