@@ -116,3 +116,29 @@ def test_fp8_decode_and_prefill_buckets_use_inputs_in_one_order(monkeypatch):
     prefill = _inputs_by_first_use(Mix(fp8), torch.zeros(256, BRANCHES * HIDDEN, dtype=torch.bfloat16))
     assert decode == prefill
     assert any("weight_scale" in n for n in decode)
+
+
+def test_jax_fp8_linear_matches_torch_path(monkeypatch):
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import (
+        build_fp8_weight_linear_op,
+        fp8_weight_linear,
+    )
+
+    assert build_fp8_weight_linear_op() is not None
+    source = _module(0, hidden=HIDDEN, lowrank=LOWRANK)
+    fp8 = _fp8_module(monkeypatch, source)
+    torch.manual_seed(7)
+    x = torch.randn(8, BRANCHES * HIDDEN).to(torch.bfloat16)
+    linear = fp8.input_mix_weight_down
+    with torch.no_grad():
+        want = fp8._hc_linear(x, "input_mix_weight_down")
+    got = fp8_weight_linear(
+        jnp.asarray(x.float().numpy(), jnp.bfloat16),
+        jnp.asarray(linear.weight.float().numpy()).astype(jnp.float8_e4m3fn),
+        jnp.asarray(linear.weight_scale.numpy()),
+    )
+    np.testing.assert_allclose(
+        np.asarray(got, np.float32), want.float().numpy(), rtol=2e-2, atol=1e-3
+    )

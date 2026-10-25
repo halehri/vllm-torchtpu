@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_QWEN4_HC_DECODE_FUSED: bool = False
     VLLM_TPU_HC_FP8_WEIGHTS: bool = False
+    VLLM_TPU_HC_FP8_JAX_DOT: bool = False
     QWEN4_EXP_PREFILL_SP: bool = False
     QWEN4_EXP_PREFILL_SP_MIN_TOKENS: int = 1024
     QWEN4_EXP_PREFILL_SP_MOE: bool = False
@@ -829,6 +830,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # mixes are bound by these weights' bytes; BF16 activations and FP32
     # epilogues are unchanged. Disables TPU_QWEN4_HC_DECODE_FUSED.
     "VLLM_TPU_HC_FP8_WEIGHTS": env_bool("VLLM_TPU_HC_FP8_WEIGHTS"),
+    # qwen4_exp, with VLLM_TPU_HC_FP8_WEIGHTS: run each FP8 HC projection as one
+    # JAX op (convert + dot + scale) so the e4m3 -> BF16 convert feeds the dot.
+    "VLLM_TPU_HC_FP8_JAX_DOT": env_bool("VLLM_TPU_HC_FP8_JAX_DOT"),
     # qwen4_exp: shard prefill-sized steps across TP ranks between attention
     # blocks (reduce-scatter instead of all-reduce), so the hyper-connection
     # streams, PLE gate and residual math run on 1/TP of the tokens. Steps

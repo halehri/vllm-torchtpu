@@ -30,6 +30,13 @@ class GatedResidual(common_hc.GatedResidual):
     ):
         super().__init__(*args, **kwargs)
         self.fp8_weights = bool(envs.VLLM_TPU_HC_FP8_WEIGHTS)
+        self._fp8_linear_op = None
+        if self.fp8_weights and envs.VLLM_TPU_HC_FP8_JAX_DOT:
+            from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import (
+                build_fp8_weight_linear_op,
+            )
+
+            self._fp8_linear_op = build_fp8_weight_linear_op()
         if self.fp8_weights:
             self._make_fp8_weights()
         if prefill_up_tile and (prefill_up_tile < 128 or prefill_up_tile % 128):
@@ -165,6 +172,8 @@ class GatedResidual(common_hc.GatedResidual):
         scale = getattr(linear, "weight_scale", None)
         if scale is None:
             return F.linear(x, linear.weight)
+        if self._fp8_linear_op is not None and x.dim() == 2:
+            return self._fp8_linear_op(x, linear.weight, scale)
         out = F.linear(x, linear.weight.to(x.dtype))
         return (out.float() * scale.reshape(-1)).to(x.dtype)
 

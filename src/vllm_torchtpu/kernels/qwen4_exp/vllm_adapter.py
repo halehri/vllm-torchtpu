@@ -206,3 +206,34 @@ def build_decode_combine_mix_op(branches: int, hidden: int, eps: float):
         )
 
     return op
+
+
+def fp8_weight_linear(x: jax.Array, weight: jax.Array, scale: jax.Array) -> jax.Array:
+    """``x @ w.T`` for an e4m3 weight [N, K] with a per-output FP32 scale [N, 1].
+    Rounds like the Torch path: BF16 dot result, then scaled in FP32."""
+    import jax.numpy as jnp
+
+    out = jax.lax.dot_general(
+        x,
+        weight.astype(x.dtype),
+        (((1,), (1,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    ).astype(x.dtype)
+    return (out.astype(jnp.float32) * scale.reshape(1, -1)).astype(x.dtype)
+
+
+@functools.cache
+def build_fp8_weight_linear_op():
+    """:func:`fp8_weight_linear` as one JAX op, so XLA feeds the e4m3 -> BF16
+    convert straight into the dot."""
+
+    def core(x: jax.Array, weight: jax.Array, scale: jax.Array) -> jax.Array:
+        return fp8_weight_linear(x, weight, scale)
+
+    op = pallas.jax_op("qwen4_exp::hc_fp8_weight_linear_v1", core)
+
+    @op.register_fake
+    def fake(x, weight, scale):
+        return x.new_empty((x.shape[0], weight.shape[0]))
+
+    return op
