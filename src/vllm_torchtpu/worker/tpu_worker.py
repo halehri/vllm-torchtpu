@@ -773,6 +773,9 @@ class TPUWorker(WorkerBase):
         # from scanning those objects mid-step.
         freeze_gc_heap()
         maybe_attach_gc_debug_callback()
+        # Warmup (dummy runs, spec-decode warmup requests) is over: steps from here
+        # on serve real requests (read by the megakernel check mode).
+        self.model_runner.warmup_done = True
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:
