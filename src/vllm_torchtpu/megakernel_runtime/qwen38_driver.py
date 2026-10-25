@@ -149,6 +149,14 @@ def _pallas_tp_mesh(runner: Any) -> Any:
     return _build_tp_rank_mesh(8, getattr(runner, "mesh", None))
 
 
+def _real_traffic(kw: dict) -> bool:
+    """A served step rather than a warmup dummy: some request has more than 64 tokens of context."""
+    ctx = kw.get("context_lens")
+    if not isinstance(ctx, torch.Tensor) or ctx.numel() == 0:
+        return True
+    return int(ctx.max()) > 64
+
+
 def _compare_rows(a: torch.Tensor, b: torch.Tensor, valid: torch.Tensor) -> dict:
     """`a` vs reference `b` over valid rows: NaN rows per side, rel / max_abs over rows finite on both."""
     a32, b32 = a.float(), b.float()
@@ -440,6 +448,7 @@ class Qwen38SegmentDriver:
         drv = cls(runner, _parse_buckets(raw), head=_parse_flag(raw, "head", True))
         drv.check_left = _parse_check(raw)
         drv.parts_left = _parse_int(raw, "checkparts") or 0
+        qwen38_segment_call.NO_STATE = _parse_flag(raw, "nostate", False)
         segs = _parse_int(raw, "segs")
         if segs is not None:
             drv.segments.mk_segments = segs
@@ -781,6 +790,11 @@ class Qwen38SegmentDriver:
             if self.mk_calls <= 2:
                 self._log_gdn_meta()
         kw = dict(model_kwargs or {})
+        if self.check_left > 0 and not _real_traffic(kw):
+            # Check mode only spends its checks on real requests: warmup's dummy
+            # steps (contexts of a few tokens) carry garbage rows on both paths.
+            self._note("check_skip_warmup")
+            return False, None
         first_warm = self.warm and self.mk_calls == 1
         if first_warm:
             self._tp_barrier("before the first (compiling) call")

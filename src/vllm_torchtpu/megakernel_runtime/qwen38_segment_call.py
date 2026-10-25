@@ -46,6 +46,8 @@ DEFAULT_HIER = 2
 DEFAULT_RINGS: tuple[int, int] | None = None
 # `VLLM_TPU_MEGAKERNEL=...,gdnclamp=1`: block ids outside the pool go to the null block 0.
 CLAMP_BLOCKS = False
+# `VLLM_TPU_MEGAKERNEL=...,nostate=1`: every GDN layer starts from a zero state (bisecting).
+NO_STATE = False
 
 
 def ring_depths(B: int) -> tuple[int, int]:
@@ -116,7 +118,7 @@ def gdn_blocks(
         rb = jnp.take_along_axis(ck, off[st][:, None], axis=1)[:, 0]
         rbs.append(inside(jnp.where(live, rb, 0)))
         wbs.append(inside(jnp.where(live[:, None] & write, ck, 0)))
-        his.append(live & ((_fit(seq, NS) - q_len) > 0))
+        his.append(live & ((_fit(seq, NS) - q_len) > 0) & (not NO_STATE))
     return jnp.stack(rbs), jnp.stack(wbs), jnp.stack(his)
 
 
