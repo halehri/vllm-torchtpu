@@ -115,6 +115,17 @@ def _own_operand(t: torch.Tensor, param_storages: set[int]) -> torch.Tensor:
     return torch.empty_like(t, memory_format=torch.contiguous_format).copy_(t)
 
 
+def _frozen(t: torch.Tensor) -> nn.Parameter:
+    """A packed operand as a frozen parameter of the segment module.
+
+    Registered buffers reach the compiled program as lifted mutable inputs and
+    every one was re-materialised per step in its own execute_as_strided
+    program (q32 / q39: ~93 per step); the routed-expert operands, which are
+    the layers' own Parameters, were not.
+    """
+    return nn.Parameter(t, requires_grad=False)
+
+
 # `VLLM_TPU_MEGAKERNEL=...,nodonate=1`: the GDN pool is not donated to the segment op; it
 # writes a fresh pool that `_run` copies back into the live cache (bisecting a served hang).
 NO_DONATE = False
@@ -274,8 +285,8 @@ class Qwen38Segments(nn.Module):
         if shared is not None:
             # A shadow view: same operands, GDN checkpoints not written.
             self.n_w, self.n_hw = shared.n_w, shared.n_hw
-            for name, buf in shared.named_buffers(recurse=False):
-                self.register_buffer(name, buf, persistent=False)
+            for name, buf in shared.named_parameters(recurse=False):
+                self.register_parameter(name, buf)
             # Plain reference (not a submodule), like `layers`.
             object.__setattr__(self, "_shared", shared)
             self.pool = self.layout = None
@@ -290,7 +301,7 @@ class Qwen38Segments(nn.Module):
             ops = pack_segment_operands(model, g, s, qwen38.segment_spec(g, R, L=L), ex)
             self.n_w.append(len(ops))
             for i, t in enumerate(ops):
-                self.register_buffer(f"w{s}_{i}", _own_operand(t, params), persistent=False)
+                self.register_parameter(f"w{s}_{i}", _frozen(_own_operand(t, params)))
         self.n_hw: list[int] = []
         for h, group in enumerate(self.head_groups):
             L = len(group)
@@ -299,7 +310,7 @@ class Qwen38Segments(nn.Module):
             ops = pack_segment_operands(model, g, -1, spec, ex, layer_ids=group, head=True)
             self.n_hw.append(len(ops))
             for i, t in enumerate(ops):
-                self.register_buffer(f"h{h}_{i}", _own_operand(t, params), persistent=False)
+                self.register_parameter(f"h{h}_{i}", _frozen(_own_operand(t, params)))
         self.pool = None
         self.layout = None
 
@@ -394,7 +405,7 @@ class MtpTail(nn.Module):
         params = _param_storages(draft)
         self.n_w = len(ops)
         for i, t in enumerate(ops):
-            self.register_buffer(f"w_{i}", _own_operand(t, params), persistent=False)
+            self.register_parameter(f"w_{i}", _frozen(_own_operand(t, params)))
 
     def forward(self, hidden: torch.Tensor, attention: torch.Tensor) -> torch.Tensor:
         w = [getattr(self, f"w_{i}") for i in range(self.n_w)]
