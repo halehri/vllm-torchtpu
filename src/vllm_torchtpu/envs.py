@@ -86,6 +86,8 @@ if TYPE_CHECKING:
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
     VLLM_TPU_QSA_TOPK_STATS: int = 0
+    VLLM_TPU_QSA_UNION_STATS: int = -1
+    VLLM_TPU_QSA_UNION_STATS_EVERY: int = 200
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
     VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK: int = 256
     VLLM_TPU_QSA_RING_SELECT: bool = False
@@ -503,6 +505,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of selected groups, overlap of a request's verify rows) from a host
     # callback. 0 (default) adds nothing to the program.
     "VLLM_TPU_QSA_TOPK_STATS": env_nonnegative_int("VLLM_TPU_QSA_TOPK_STATS", 0),
+    # Debug only: the model layer index of one QSA layer whose prefill
+    # selection unions (kernels/qwen4_exp/union_stats.py) are accumulated into
+    # a device buffer and logged every VLLM_TPU_QSA_UNION_STATS_EVERY forwards.
+    # -1: off.
+    "VLLM_TPU_QSA_UNION_STATS": lambda: int(os.getenv("VLLM_TPU_QSA_UNION_STATS", "-1")),
+    "VLLM_TPU_QSA_UNION_STATS_EVERY": env_nonnegative_int(
+        "VLLM_TPU_QSA_UNION_STATS_EVERY", 200
+    ),
     # Compressed keys per KV block of the shared-stream pass above (a multiple
     # of 128). Only read when VLLM_TPU_QSA_DECODE_QUERY_BLOCK > 0.
     "VLLM_TPU_QSA_DECODE_KV_BLOCK": env_nonnegative_int(

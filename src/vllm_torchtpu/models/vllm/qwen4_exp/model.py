@@ -881,6 +881,8 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
 
     def forward(self, input_ids, positions, inputs_embeds=None, **kwargs):
+        if envs.VLLM_TPU_QSA_UNION_STATS >= 0:
+            self._log_union_stats()
         # The route reads the padded bucket size outside both compiled graphs.
         if self.model_sp is None:
             return self.model(input_ids, positions, inputs_embeds, **kwargs)
@@ -890,6 +892,18 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 return self.model_sp(input_ids, positions, inputs_embeds, **kwargs)
         with bucket_filter.serving(bucket_filter.assigned(self.model)):
             return self.model(input_ids, positions, inputs_embeds, **kwargs)
+
+    def _log_union_stats(self):
+        """Debug only: log the QSA prefill selection unions (outside the graph)."""
+        self._union_calls = getattr(self, "_union_calls", 0) + 1
+        every = max(envs.VLLM_TPU_QSA_UNION_STATS_EVERY, 1)
+        if self._union_calls % every:
+            return
+        from vllm_torchtpu.kernels.qwen4_exp.union_stats import format_stats
+
+        for name, buffer in self.named_buffers():
+            if name.endswith("union_stats"):
+                print(f"qsa union stats {name}: {format_stats(buffer.cpu().tolist())}", flush=True)
 
     def embed_input_ids(self, input_ids):
         return self.model.embed_tokens(input_ids)
