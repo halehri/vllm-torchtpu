@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,6 +13,39 @@ from vllm.v1.outputs import (
 )
 
 INVALID_TOKEN_ID = -1
+
+# VLLM_TPU_COMPILED_SPEC_BOOKKEEPING=0 keeps the eager spec-decode bookkeeping helpers.
+_COMPILE_BOOKKEEPING = os.environ.get("VLLM_TPU_COMPILED_SPEC_BOOKKEEPING", "1").strip().lower() not in (
+    "0", "false", "off", "no"
+)
+
+
+def _device_compiled(fn):
+    """Run `fn` as one compiled program when its tensors live on the TPU.
+
+    Eagerly, each of the spec-decode bookkeeping helpers below is ~4-8 small device ops
+    (where / sub / sum / ne / gather / cat / index ...), each its own device program per
+    step (eager-op census g04 j-262055c6); compiled, one. CPU callers (tests, host
+    paths) keep the eager function.
+    """
+    compiled = None
+
+    def wrapper(*args, **kwargs):
+        nonlocal compiled
+        first = next((a for a in args if isinstance(a, torch.Tensor)), None)
+        # A Python int argument would specialise the program per value (e.g. an exact
+        # `num_reqs` slice): keep those calls eager.
+        exact = any(isinstance(a, int) and not isinstance(a, bool) for a in args)
+        if not _COMPILE_BOOKKEEPING or exact or first is None or first.device.type == "cpu":
+            return fn(*args, **kwargs)
+        if compiled is None:
+            compiled = torch.compile(fn, backend="tpu", fullgraph=True, dynamic=False)
+        return compiled(*args, **kwargs)
+
+    wrapper.__wrapped__ = fn
+    wrapper.__name__ = fn.__name__
+    wrapper.__doc__ = fn.__doc__
+    return wrapper
 
 
 @dataclass
@@ -218,6 +252,7 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         return self._model_runner_output
 
 
+@_device_compiled
 def assemble_spec_next_tokens(
     next_tokens: torch.Tensor, drafts: torch.Tensor, num_reqs: int | None = None
 ) -> torch.Tensor:
@@ -249,6 +284,7 @@ def assemble_spec_next_tokens(
     return src.reshape(-1)  # [num_reqs * (1 + K)]
 
 
+@_device_compiled
 def subtract_num_rejected_tokens(
     seq_lens: torch.Tensor,
     positions: torch.Tensor,
@@ -292,6 +328,7 @@ def subtract_num_rejected_tokens(
     return seq_lens, positions
 
 
+@_device_compiled
 def extract_draft_token_ids(
     input_ids: torch.Tensor,
     logits_indices: torch.Tensor,
@@ -303,6 +340,7 @@ def extract_draft_token_ids(
     return input_ids[logits_indices[target_logits_indices + 1]]
 
 
+@_device_compiled
 def compute_num_rejected(
     next_tokens: torch.Tensor, num_draft: torch.Tensor
 ) -> torch.Tensor:
