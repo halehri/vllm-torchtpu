@@ -71,8 +71,7 @@ def _prepare_device_inputs(
     token_store,
     seq_lens,
     starts,
-    row_start,
-    num_requests,
+    scalars,
     state_indices,
     previous_rows,
     previous,
@@ -88,11 +87,14 @@ def _prepare_device_inputs(
 
     Run eagerly, its ~40 small ops are as many device programs per step (where /
     gather / index_copy / cat / sub / lt ... in the Perfetto trace); compiled, one.
-    `row_start` / `num_requests` are 0-d int64 tensors so the step's values do not
-    specialise the program. With `spec_window`, `current`'s three record buffers come
-    back updated (what `_speculative_ngram_context` writes in place).
+    `scalars` is an int64 `[row_start, num_requests]` device tensor, so the step's
+    values do not specialise the program. It is indexed inside the graph: 0-d views
+    passed in are suspected of costing a `tt_jit_execute_as_strided` relayout each
+    (g03: 5.5 -> 6.6 per step). With `spec_window`, `current`'s three record buffers
+    come back updated (what `_speculative_ngram_context` writes in place).
     Returns `(context, slots, history, valid_tokens, current)`.
     """
+    row_start, num_requests = scalars[0], scalars[1]
     rows = starts.shape[0] - 1
     context = (seq_lens - (starts[1:] - starts[:-1])).to(torch.int64)
     arange_rows = torch.arange(rows, dtype=torch.int64, device=starts.device)
@@ -317,8 +319,7 @@ class Qwen4ExpAdapter:
             snapshot.token_store,
             ctx.seq_lens,
             starts,
-            scalars[0],
-            scalars[1],
+            scalars,
             None if self.pooled else ctx.mamba_state_indices,
             previous_rows,
             previous,
