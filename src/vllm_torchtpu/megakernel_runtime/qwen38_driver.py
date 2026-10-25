@@ -235,7 +235,7 @@ class _SegmentKind:
         @op.register_fake
         def _(hidden, attn, weights, gdn_io):
             out = [torch.empty_like(hidden)]
-            if has_gdn:
+            if has_gdn and write:
                 out.append(torch.empty_like(gdn_io[0]))
             return out
 
@@ -366,9 +366,13 @@ class Qwen38Segments(nn.Module):
         program, and a traced graph that branches on it is rejected
         (ShapeSpecializationError). The op resolves the bucket itself.
         """
-        if kind.has_gdn:
+        if kind.has_gdn and kind.write:
             res, pool = kind.op(hidden, lead, w, [self.pool, *meta])
             self.pool.copy_(pool)
+            return res
+        if kind.has_gdn:
+            # Shadow: reads the pool, writes nothing back.
+            (res,) = kind.op(hidden, lead, w, [self.pool, *meta])
             return res
         (res,) = kind.op(hidden, lead, w, [])
         return res

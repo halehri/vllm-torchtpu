@@ -213,10 +213,17 @@ def build_segment_call(
         if not has_gdn:
             return (unpad(outs[0]),)
         res, conv_ck, rec_ck = outs
+        if not write:
+            # Read-only (check-mode shadow): no checkpoint scatter, no pool output.
+            return (unpad(res),)
         return unpad(res), scatter(pool, conv_ck, rec_ck, wb)
 
     in_specs = (tp,) * n_lead + (tp,) * n_w
     if has_gdn:
         in_specs += (tp,) + (rep,) * n_meta
+        if not write:
+            # The pool is only read: neither donated nor returned, so ops after
+            # this call (the stock layers in check mode) read it untouched.
+            return call, in_specs, (tp,), ()
         return call, in_specs, (tp, tp), (n_lead + n_w,)
     return call, in_specs, (tp,), ()
