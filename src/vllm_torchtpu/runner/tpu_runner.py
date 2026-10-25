@@ -3732,6 +3732,25 @@ class TPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput | None:
+        trace = self._eager_op_trace()
+        if scheduler_output.total_num_scheduled_tokens:
+            trace.count_step()
+        with trace.step():
+            return self._execute_model_impl(scheduler_output, intermediate_tensors)
+
+    def _eager_op_trace(self):
+        trace = getattr(self, "_eager_trace", None)
+        if trace is None:
+            from vllm_torchtpu.runner.eager_op_trace import EagerOpTrace
+
+            trace = self._eager_trace = EagerOpTrace()
+        return trace
+
+    def _execute_model_impl(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput | None:
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -4624,6 +4643,12 @@ class TPUModelRunner(GPUModelRunner):
 
     @_pp_step
     def sample_tokens(
+        self, grammar_output: "GrammarOutput | None"
+    ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
+        with self._eager_op_trace().step():
+            return self._sample_tokens_impl(grammar_output)
+
+    def _sample_tokens_impl(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
         if self.execute_model_state is None:
