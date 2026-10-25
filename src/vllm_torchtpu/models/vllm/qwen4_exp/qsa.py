@@ -7,6 +7,8 @@ from dataclasses import dataclass, replace
 from functools import partial
 from typing import cast
 
+import re
+
 import torch
 from torch import nn
 from vllm.distributed import tensor_model_parallel_all_reduce
@@ -285,6 +287,25 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         # Set by a module whose graph is traced once for every token bucket (the
         # MTP draft): ops must not choose their structure by the token count.
         self.single_graph = False
+        # Debug only (VLLM_TPU_QSA_UNION_STATS = this layer's index): prefill
+        # selection unions accumulated on device, read outside the graph.
+        self._union_stats_op = None
+        layer = re.search(r"(?<!mtp\.)layers\.(\d+)\.", prefix)
+        if (
+            layer is not None
+            and "mtp" not in prefix
+            and int(layer.group(1)) == envs.VLLM_TPU_QSA_UNION_STATS
+        ):
+            from vllm_torchtpu.kernels.qwen4_exp.union_stats import (
+                STATS,
+                build_union_stats_op,
+            )
+
+            self._union_stats_op = build_union_stats_op()
+            self.register_buffer(
+                "union_stats", torch.zeros(STATS, dtype=torch.int32, device=device),
+                persistent=False,
+            )
         kv_size = min(tp_size, self.total_num_kv_heads)
         kv_rank = tp_rank // max(tp_size // self.total_num_kv_heads, 1)
         with torch.device(device or "cpu"), set_default_torch_dtype(torch.bfloat16):
@@ -640,6 +661,8 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 else {}
             ),
         )
+        if getattr(self, "_union_stats_op", None) is not None and rows is None:
+            self.union_stats.copy_(self._union_stats_op(selected, self.union_stats))
         if pick_rows:
             keep = (rows >= 0)[:, None]
             picked = rows.clamp_min(0)
