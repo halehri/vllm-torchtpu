@@ -608,16 +608,19 @@ class Qwen38SegmentDriver:
         self.check_left -= 1
         return stock
 
-    def _component_check(self, runner: Any, input_ids: Any, positions: Any, kw: dict) -> None:
-        """Per-component kernel vs stock on the same input and state (eager, logged).
+    def _component_check(self, runner: Any, input_ids: Any, positions: Any, kw: dict) -> Any:
+        """Per-component and end-to-end kernel vs stock on one step (eager, logged).
 
-        Follows `forward_segments`: embed, each head group (kernel after the
-        group's PLE vs the group's stock layers), then each segment (HC mix and
-        stock attention, then the segment kernel vs the segment's stock layers).
-        Every component starts from the stock output of the previous one, so a
-        wrong component shows up alone. Kernel calls use the shadow segments (no
-        GDN checkpoint writes) and run before the stock layers of the same
-        component, so both read the same GDN state.
+        Follows `forward_segments`. Head group: PLE applied once (its history
+        write advances the PLE state, so a second application in the same step
+        would read this step's own checkpoint), then the head kernel vs the
+        group's stock layers with that PLE disabled, on the same input.
+        Segment `s`: HC mix + stock attention, then the segment kernel vs the
+        segment's stock layers, on the stock input ("seg"), and on the kernel
+        chain's own input ("chain", the kernel path from the stock head output
+        on). Kernel calls use the shadow segments (no GDN writes) and run before
+        the stock layers that write the same state. Returns the stock output,
+        which is what this step serves.
         """
         from vllm_torchtpu.models.vllm.qwen4_exp.qsa import QSAMetadata
 
@@ -645,26 +648,31 @@ class Qwen38SegmentDriver:
 
         rows = []
 
-        def cmp(name: str, a: Any, b: Any) -> None:
+        def cmp(name: str, a: Any, b: Any) -> dict:
             st = _compare_rows(a, b, valid)
             rows.append((name, st))
             logger.info(
                 "qwen38 megakernel component %s: valid=%d nan_mk=%d nan_stock=%d rel=%.4g max_abs=%.4g",
                 name, st["valid"], st["nan_a"], st["nan_b"], st["rel"], st["max_abs"],
             )
+            return st
 
         qsa = [i for i, layer in enumerate(layers) if layer.layer_type == "full_attention"]
         with torch.no_grad():
             x = bb.embed_tokens(input_ids).repeat(1, bb.hc_count)
-            cmp("embed", x, x)  # sanity: valid count, NaN in the embedding itself
             if seg.head_groups:
                 for h, group in enumerate(seg.head_groups):
-                    xp = layers[group[0]].apply_ple(
+                    first = layers[group[0]]
+                    xp = first.apply_ple(
                         x, ids64, kw["query_start_loc"], kw["ngram_context"],
                         kw["state_slots"], kw["context_lens"],
                     )
                     y_mk = seg.head(h, xp)
-                    y_st = stock(x, group)
+                    ple, first.ple = first.ple, None
+                    try:
+                        y_st = stock(xp, group)
+                    finally:
+                        first.ple = ple
                     cmp(f"head{h}[L{group[0]}-{group[-1]}]", y_mk, y_st)
                     x = y_st
             else:
@@ -673,21 +681,32 @@ class Qwen38SegmentDriver:
                 kw["query_start_loc"], kw["context_lens"], kw["state_slots"],
                 kw["main_block_table"], kw["compressed_block_table"],
             )
+            x_mk = x
             for s_i, q in enumerate(qsa):
                 ids = segment_layers(self.g, s_i)
+                block, _ = layers[q].attn_hyper_connection.mix(x_mk)
+                y_chain = seg(s_i, x_mk, layers[q].self_attn.attend(block, pos64, meta))
                 block, _ = layers[q].attn_hyper_connection.mix(x)
-                att = layers[q].self_attn.attend(block, pos64, meta)
-                y_mk = seg(s_i, x, att)
+                y_mk = seg(s_i, x, layers[q].self_attn.attend(block, pos64, meta))
                 y_st = stock(x, ids)
                 cmp(f"seg{s_i}[L{ids[0]}-{ids[-1]}]", y_mk, y_st)
-                x = y_st
-        first_nan = next((n for n, st in rows if st["nan_a"] or st["nan_b"]), "none")
-        first_bad = next((n for n, st in rows if st["rel"] > 0.05), "none")
+                cmp(f"chain{s_i}", y_chain, y_st)
+                x, x_mk = y_st, y_chain
+            mixed_st = bb.hyper_connection_mixer.mix(x)[0]
+            mixed_mk = bb.hyper_connection_mixer.mix(x_mk)[0]
+            st = cmp("final", mixed_mk, mixed_st)
+            top_mk = runner.model.compute_logits(mixed_mk).argmax(-1)
+            top_st = runner.model.compute_logits(mixed_st).argmax(-1)
+            agree = float(((top_mk == top_st) & valid).sum() / valid.sum().clamp_min(1))
+        first_nan = next((n for n, r in rows if r["nan_a"] or r["nan_b"]), "none")
+        first_bad = next((n for n, r in rows if r["rel"] > 0.05), "none")
         logger.info(
-            "qwen38 megakernel component summary: first_nan=%s first_rel_over_0.05=%s (%d left)",
-            first_nan, first_bad, self.parts_left - 1,
+            "qwen38 megakernel component summary: final_rel=%.4g top1_agree=%.4f "
+            "first_nan=%s first_rel_over_0.05=%s (%d left)",
+            st["rel"], agree, first_nan, first_bad, self.parts_left - 1,
         )
         self.parts_left -= 1
+        return (mixed_st, x) if bb.emit_mtp_hidden else mixed_st
 
     def _tp_barrier(self, what: str) -> None:
         import time
@@ -794,13 +813,20 @@ class Qwen38SegmentDriver:
         if first_warm:
             self._tp_barrier("before the first (compiling) call")
         try:
+            out = None
             if self.parts_left > 0 and self.check_left > 0:
+                # The eager component check serves this step itself (stock output,
+                # PLE applied once); the compiled shadow below would apply PLE a
+                # second time in the step and compare against a corrupted reference.
                 try:
-                    self._component_check(runner, input_ids, positions, kw)
+                    out = self._component_check(runner, input_ids, positions, kw)
+                    self.check_left -= 1
                 except Exception:
                     logger.exception("qwen38 megakernel component check failed")
                     self.parts_left = 0
-            if self.check_left > 0 and self.shadow is not None:
+            if out is not None:
+                pass
+            elif self.check_left > 0 and self.shadow is not None:
                 out = self._shadow_step(runner, input_ids, positions, kw)
             else:
                 with self._contexts(runner, "model_mk_segments"):
