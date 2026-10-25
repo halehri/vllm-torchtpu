@@ -169,12 +169,20 @@ def build_any_mix_op(branches: int, hidden: int, eps: float, inject: bool):
     static = dict(branches=branches, hidden=hidden, eps=eps)
     if inject:
 
-        def core(x, weight, down, up, inject_weight):
+        def core(
+            x: jax.Array,
+            weight: jax.Array,
+            down: jax.Array,
+            up: jax.Array,
+            inject_weight: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
             return hc_mix_any(x, weight, down, up, inject_weight, **static)
 
     else:
 
-        def core(x, weight, down, up):
+        def core(
+            x: jax.Array, weight: jax.Array, down: jax.Array, up: jax.Array
+        ) -> jax.Array:
             return hc_mix_any(x, weight, down, up, **static)[0]
 
     op = pallas.jax_op(

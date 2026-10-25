@@ -136,22 +136,7 @@ class GatedResidual(common_hc.GatedResidual):
                 values * torch.rsqrt(variance + self.hc_norm.variance_epsilon)
             )
         output = torch.cat(normalized, dim=-1)
-        scale = getattr(self, "hc_norm_scale", None)
-        if scale is None:
-            scale = 1.0 + self.hc_norm.weight.float()
-        return (output * scale).to(hyper_input.dtype)
-
-    def finalize_weights(self):
-        """Precompute the zero-centred norm scale ``1 + w`` in FP32 once.
-
-        Same values as computing it in every call (FP32 add of the BF16
-        weight), without the per-step add over [hc * H].
-        """
-        self.register_buffer(
-            "hc_norm_scale",
-            1.0 + self.hc_norm.weight.detach().float(),
-            persistent=False,
-        )
+        return (output * (1.0 + self.hc_norm.weight.float())).to(hyper_input.dtype)
 
     def disable_decode_fused(self):
         """Keep the unfused mix at every token count.

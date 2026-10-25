@@ -1041,9 +1041,6 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         }
         if missing:
             raise ValueError(f"Incomplete Qwen4Exp checkpoint: {sorted(missing)}")
-        for module in self.modules():
-            if isinstance(module, GatedResidual):
-                module.finalize_weights()
         if identity is not None:
             self.pd_loaded_weight_identity = identity.finish()
             self.pd_loaded_ple_identity = identity.finish(name_fragment=".ple.")

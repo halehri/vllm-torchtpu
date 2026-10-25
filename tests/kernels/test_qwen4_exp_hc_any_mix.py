@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HC mix for any row count (the MTP draft's fused mix) and the precomputed
-norm scale, against the GatedResidual torch path."""
+"""HC mix for any row count (the MTP draft's fused mix) against the GatedResidual torch path."""
 
 import numpy as np
 import pytest
@@ -55,15 +54,12 @@ def test_any_mix_picks_kernel_by_static_rows(monkeypatch):
     assert calls == [4, 64, 512]
 
 
-def test_precomputed_norm_scale_is_exact():
-    module = _module(3)
-    torch.manual_seed(7)
-    hyper = torch.randn(16, BRANCHES * HIDDEN).to(torch.bfloat16)
-    with torch.no_grad():
-        before = module._normalize(hyper)
-        module.finalize_weights()
-        after = module._normalize(hyper)
-    assert torch.equal(before, after)
+def test_any_mix_op_registers():
+    """The torch custom op must build (jax_op needs annotated arguments)."""
+    from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import build_any_mix_op
+
+    assert build_any_mix_op(BRANCHES, HIDDEN, EPS, True) is not None
+    assert build_any_mix_op(BRANCHES, HIDDEN, EPS, False) is not None
 
 
 def test_use_any_mix_traces_one_op_for_every_count(monkeypatch):
