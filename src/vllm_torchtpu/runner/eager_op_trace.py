@@ -4,7 +4,8 @@
 Every eager op on a TPU tensor becomes its own small device program (`tt_jit_where`,
 `tt_jit_gather`, ... in the Perfetto trace) whose name carries no source location. With
 `VLLM_TPU_TRACE_EAGER_OPS=K:M`, rank 0 records, for engine steps `K .. K+M-1` (counted on
-non-empty `execute_model` calls), every aten op that reaches the Python dispatcher during
+non-empty `execute_model` calls), every aten op on a device tensor that reaches the Python
+dispatcher during
 `execute_model` / `sample_tokens` together with the innermost vLLM / vllm_torchtpu frame
 that issued it, then logs the per-step counts once. Compiled programs (the model forward, the
 drafter loop, jitted helpers) run as single calls after warm-up, so their internals are not
@@ -32,6 +33,18 @@ def _parse(spec: str) -> tuple[int, int] | None:
         return None
     k, _, m = spec.partition(":")
     return int(k), int(m or 100)
+
+
+def _on_device(obj: Any) -> bool:
+    import torch
+
+    if isinstance(obj, torch.Tensor):
+        return obj.device.type != "cpu"
+    if isinstance(obj, (list, tuple)):
+        return any(_on_device(o) for o in obj)
+    if isinstance(obj, dict):
+        return any(_on_device(o) for o in obj.values())
+    return False
 
 
 def _site() -> str:
@@ -90,8 +103,12 @@ class EagerOpTrace:
                 return True
 
             def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # noqa: ANN001
-                counts[(str(func.overloadpacket.__name__), _site())] += 1
-                return func(*args, **(kwargs or {}))
+                out = func(*args, **(kwargs or {}))
+                # Only ops touching a device tensor become device programs; host-side
+                # bookkeeping on CPU tensors (block-table mirrors, staging) is skipped.
+                if _on_device(args) or _on_device(kwargs) or _on_device(out):
+                    counts[(str(func.overloadpacket.__name__), _site())] += 1
+                return out
 
         self.active = True
         try:
