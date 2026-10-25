@@ -608,6 +608,7 @@ class Qwen4ExpBackbone(nn.Module):
         valid_tokens,
         main_block_table,
         compressed_block_table,
+        check_parts: bool = False,
     ):
         """``forward`` with the layers between QSA attention cores in megakernels.
 
@@ -669,7 +670,7 @@ class Qwen4ExpBackbone(nn.Module):
         # `check_parts` (check mode): each segment also runs its stock layers on
         # the same input; the stock output continues, and both are returned
         # stacked [n_seg, T, hc*H] for the driver to compare.
-        check = bool(getattr(segment_call, "check_parts", False))
+        check = check_parts
         mk_outs: list = []
         st_outs: list = []
         for s, i in enumerate(qsa_layers):
@@ -769,6 +770,54 @@ class Qwen4ExpSegmentModel(nn.Module):
             valid_tokens=valid_tokens,
             main_block_table=main_block_table,
             compressed_block_table=compressed_block_table,
+        )
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+        "valid_tokens": 0,
+    }
+)
+class Qwen4ExpSegmentCheckModel(nn.Module):
+    """``Qwen4ExpSegmentModel`` in check mode: a class (and compiled graph) of its
+    own, returning ``(mixed, hidden, kernel outputs, stock outputs)``."""
+
+    def __init__(self, *, vllm_config, prefix: str = "", backbone, segments) -> None:
+        super().__init__()
+        self.prefix = prefix
+        self.backbone = backbone
+        self.segments = segments
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        inputs_embeds=None,
+        *,
+        query_start_loc,
+        ngram_context,
+        state_slots,
+        context_lens,
+        valid_tokens,
+        main_block_table,
+        compressed_block_table,
+    ):
+        return type(self.backbone).forward_segments(
+            self.backbone,
+            input_ids,
+            positions,
+            self.segments,
+            query_start_loc=query_start_loc,
+            ngram_context=ngram_context,
+            state_slots=state_slots,
+            context_lens=context_lens,
+            valid_tokens=valid_tokens,
+            main_block_table=main_block_table,
+            compressed_block_table=compressed_block_table,
+            check_parts=True,
         )
 
 

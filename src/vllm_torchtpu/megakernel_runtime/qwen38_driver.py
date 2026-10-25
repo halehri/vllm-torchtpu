@@ -570,9 +570,10 @@ class Qwen38SegmentDriver:
                 runner.model, self.g, self.mesh, self.buckets, shared=self.segments, head=False
             )
             check_seg.bind_pool()
-            check_seg.check_parts = True
+            from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpSegmentCheckModel
+
             with self._contexts(runner, "model_mk_segments_segcheck"):
-                self.segcheck = Qwen4ExpSegmentModel(
+                self.segcheck = Qwen4ExpSegmentCheckModel(
                     vllm_config=self.cfg,
                     prefix="model_mk_segments_segcheck",
                     backbone=runner.model.model,
