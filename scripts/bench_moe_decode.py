@@ -24,6 +24,7 @@ from jax.sharding import PartitionSpec as P
 from vllm_torchtpu.kernels.experimental.fused_moe_decode import fused_moe_decode
 
 N, H, INTER, INTER_S, E, TOPK = 8, 2560, 640, 128, 64, 8
+REPS = 48  # calls chained inside one jit, like 48 layers, so dispatch amortizes
 F8 = jnp.float8_e4m3fn
 EXPERT_BYTES = H * 2 * INTER + INTER * H  # FP8 w13 + w2
 
@@ -77,20 +78,27 @@ def test_moe_decode_bandwidth():
     specs = (P("d"),) * 10 + (P(), P("d"), P("d"))
 
     def body(r, x, w1, w2, w1s, w2s, sw1, sw1s, sw2, sw2s, g, tw, ti):
-        return fused_moe_decode(
-            r.reshape(-1), x, w1, w2, w1s, w2s, sw1, sw1s, sw2, sw2s, g, tw, ti,
-            n_ranks=N, expert_start=r.reshape(()) * E,
-        )
+        for _ in range(REPS):
+            x = fused_moe_decode(
+                r.reshape(-1), x, w1, w2, w1s, w2s, sw1, sw1s, sw2, sw2s, g, tw, ti,
+                n_ranks=N, expert_start=r.reshape(()) * E,
+            )
+        return x
+
+    def chained_psum(x):
+        for _ in range(REPS):
+            x = jax.lax.psum(x, "d") * 0.125
+        return x
 
     fused = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=specs, out_specs=P("d"),
                                   check_vma=False))
-    psum = jax.jit(jax.shard_map(lambda x: jax.lax.psum(x, "d"), mesh=mesh,
+    psum = jax.jit(jax.shard_map(chained_psum, mesh=mesh,
                                  in_specs=P("d"), out_specs=P("d"), check_vma=False))
     rng = np.random.default_rng(0)
     for m in (4, 8, 16, 32, 64, 128):
         x = jax.device_put(
             jnp.tile(jnp.asarray(rng.normal(size=(m, H)), jnp.bfloat16), (N, 1)), sh)
-        t = _time(psum, (x,))
+        t = _time(psum, (x,)) / REPS
         print("MOEBW " + json.dumps(dict(kind="psum", m=m, us=t * 1e6)), flush=True)
         tw = rng.dirichlet(np.ones(TOPK), size=m).astype(np.float32)
         tw = jax.device_put(jnp.tile(jnp.asarray(tw, jnp.bfloat16), (N, 1)), sh)
@@ -100,7 +108,7 @@ def test_moe_decode_bandwidth():
                      for r in range(N)]
             ti = jax.device_put(jnp.tile(jnp.asarray(ids), (N, 1)), sh)
             try:
-                t = _time(fused, (rank, x, *weights, gate, tw, ti))
+                t = _time(fused, (rank, x, *weights, gate, tw, ti)) / REPS
             except Exception as e:  # e.g. a VMEM limit at large m
                 print("MOEBW " + json.dumps(dict(kind=kind, m=m, error=str(e)[:300])), flush=True)
                 continue
