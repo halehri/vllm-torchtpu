@@ -517,3 +517,22 @@ def test_max_consecutive_holds_env_var_and_compile_cache(
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS"
         not in tpu_compiler._tpu_compile_env_factors()
     )
+
+
+def test_srpt_max_decodes_falls_back_to_upstream_order(shared_model_config, monkeypatch):
+    monkeypatch.setenv("VLLM_TPU_SRPT_MAX_DECODES", "1")
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        scheduler_cls=SrptPrefillScheduler,
+        max_num_seqs=4,
+        max_num_batched_tokens=16,
+    )
+    scheduler.add_request(_make_real_request("dec", 8, hasher, seed=3))
+    scheduler.schedule()  # `dec` prefills in one step, then decodes
+    req_long = _make_real_request("long", 64, hasher, seed=1)
+    scheduler.add_request(req_long)
+    scheduler.schedule()  # `long` starts prefilling
+    scheduler.add_request(_make_real_request("short_wait", 16, hasher, seed=2))
+    out = scheduler.schedule().num_scheduled_tokens
+    # One decode is running (>= 1): no hold-back, `long` keeps its place.
+    assert "long" in out and "short_wait" not in out

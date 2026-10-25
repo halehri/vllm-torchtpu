@@ -80,6 +80,15 @@ class SrptPrefillScheduler(AsyncScheduler):
         )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        max_decodes = envs.VLLM_TPU_SRPT_MAX_DECODES
+        if max_decodes and (
+            sum(1 for r in self.running if not r.is_prefill_chunk) >= max_decodes
+        ):
+            # Many decodes wait on every prefill step: reordering and holding
+            # back running chunks there admits more concurrent prefills and
+            # lengthens the decodes' stall (c32: p90 interactivity -13%),
+            # so fall back to the upstream order.
+            return super().schedule(throttle_prefills)
         held: list[Request] = []
         target = None
         prefilling: list[Request] = []

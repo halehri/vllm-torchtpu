@@ -224,6 +224,7 @@ if TYPE_CHECKING:
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
+    VLLM_TPU_SRPT_MAX_DECODES: int = 0
     VLLM_TPU_MEGAKERNEL: str = ""
 
 
@@ -1389,6 +1390,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_nonnegative_int(
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
     ),
+    # SRPT reordering/hold-back applies only while fewer than this many decodes
+    # run (0 = always).
+    "VLLM_TPU_SRPT_MAX_DECODES": env_nonnegative_int("VLLM_TPU_SRPT_MAX_DECODES", 0),
     # Enable and configure the fused Pallas megakernel ("1"/"true" for defaults,
     # "ep"/"tp" for mode, or "mode=tp,buckets=8:16:32,verify_buckets=4:8:16,ab=1").
     "VLLM_TPU_MEGAKERNEL": env_str("VLLM_TPU_MEGAKERNEL", ""),
