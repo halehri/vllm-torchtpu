@@ -6,8 +6,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from tests.kernels.test_qwen4_exp_hc_decode import BRANCHES, _module
+from tests.kernels.test_qwen4_exp_hc_decode import BRANCHES, EPS, _module
 from vllm_torchtpu import envs
+from vllm_torchtpu.models.vllm.qwen4_exp.hyperconnection import (
+    GatedResidual,
+    HyperConnectionConfig,
+)
 
 HIDDEN, LOWRANK = 128, 32
 NAMES = ("input_mix_weight_down", "input_mix_weight_up", "block_inject_weight")
@@ -15,7 +19,16 @@ NAMES = ("input_mix_weight_down", "input_mix_weight_up", "block_inject_weight")
 
 def _fp8_module(monkeypatch, source):
     monkeypatch.setattr(envs, "VLLM_TPU_HC_FP8_WEIGHTS", True)
-    module = _module(0, hidden=HIDDEN, lowrank=LOWRANK)
+    module = GatedResidual(
+        HyperConnectionConfig(
+            hc_count=BRANCHES,
+            hidden_size=HIDDEN,
+            params_dtype=torch.bfloat16,
+            hc_lowrank=LOWRANK,
+            rms_norm_eps=EPS,
+            hc_per_branch_norm=True,
+        )
+    )
     monkeypatch.setattr(envs, "VLLM_TPU_HC_FP8_WEIGHTS", False)
     with torch.no_grad():
         module.hc_norm.weight.copy_(source.hc_norm.weight)
