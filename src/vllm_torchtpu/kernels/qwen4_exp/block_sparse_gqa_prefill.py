@@ -2,6 +2,7 @@
 """QSA block-sparse prefill with query-block reuse across paged KV tiles."""
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -224,16 +225,20 @@ def _kernel(
     kv_head_offset: int = 0,
     bf16_mxu: bool = False,
     query_tile: int = 256,
+    ablate: str = "",
 ):
     block = pl.program_id(0)
     # The model produces BF16 queries.  A BF16 call boundary can avoid a large
     # FP32 input window while preserving the existing FP32 QK accumulation.
-    q = (
-        query_ref[...]
-        .astype(jnp.float32)
-        .reshape(query_block, kv_heads, q_heads_per_kv, head_dim)
-        .transpose(1, 2, 0, 3)
-    )
+    if "noq" in ablate:  # bench-only: skip the query load/transpose
+        q = jnp.zeros((kv_heads, q_heads_per_kv, query_block, head_dim), jnp.float32)
+    else:
+        q = (
+            query_ref[...]
+            .astype(jnp.float32)
+            .reshape(query_block, kv_heads, q_heads_per_kv, head_dim)
+            .transpose(1, 2, 0, 3)
+        )
     # BF16 queries and BF16/FP8 KV values are exact in BF16, so one BF16 MXU
     # pass with FP32 accumulation forms the same QK products as an FP32 dot,
     # which Mosaic runs as a multi-pass FP32 matmul.
@@ -246,6 +251,8 @@ def _kernel(
     positions = lengths_ref[:, 0] - 1
     row = jnp.arange(kv_tile, dtype=jnp.int32)
     count = active_counts_ref[block]
+    if "notiles" in ablate:  # bench-only: no KV tiles at all
+        count = count * 0
 
     def active_tile(slot):
         slot = jnp.minimum(slot, num_kv_tiles - 1)
@@ -309,9 +316,10 @@ def _kernel(
     # Larger query blocks reuse one resident KV tile across query subtiles.
     num_query_tiles = query_block // query_tile
     # Preserve -inf initialization and all-masked-row guards exactly.
-    max_ref[...] = jnp.full(max_ref.shape, -jnp.inf, jnp.float32)
-    mass_ref[...] = jnp.zeros(mass_ref.shape, jnp.float32)
-    accumulator_ref[...] = jnp.zeros(accumulator_ref.shape, jnp.float32)
+    if "noinit" not in ablate:  # bench-only switch
+        max_ref[...] = jnp.full(max_ref.shape, -jnp.inf, jnp.float32)
+        mass_ref[...] = jnp.zeros(mass_ref.shape, jnp.float32)
+        accumulator_ref[...] = jnp.zeros(accumulator_ref.shape, jnp.float32)
 
     def compute_tile(tile, kv_ref):
         logical = tile * kv_tile
@@ -462,6 +470,9 @@ def _kernel(
         wait_tile(tile, kv0_ref, sem0_ref)
         compute_tile(tile, kv0_ref)
 
+    if "noepi" in ablate:  # bench-only: skip normalize/transpose/concat
+        output_ref[...] = jnp.zeros(output_ref.shape, output_ref.dtype)
+        return
     output_tiles = []
     for query_tile_index in range(num_query_tiles):
         heads = []
@@ -671,6 +682,7 @@ def block_sparse_gqa_prefill(
             **({"kv_head_offset": kv_head_offset} if kv_head_offset else {}),
             **({"bf16_mxu": True} if bf16_mxu else {}),
             query_tile=query_tile,
+            ablate=os.environ.get("QSA_PREFILL_ABLATE", ""),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
