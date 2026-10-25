@@ -81,6 +81,14 @@ class EagerOpTrace:
         counts = self.counts
 
         class _Mode(TorchDispatchMode):
+            # Reported as an infra mode so torch.compile'd helpers called inside the step
+            # (e.g. _staged_walk_products_compiled, fullgraph=True) still run their compiled
+            # code: with a non-infra mode present Dynamo skips every frame and raises
+            # (g01 j-3b5c3f5c: "non-infra torch dispatch mode present").
+            @classmethod
+            def is_infra_mode(cls) -> bool:
+                return True
+
             def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # noqa: ANN001
                 counts[(str(func.overloadpacket.__name__), _site())] += 1
                 return func(*args, **(kwargs or {}))
