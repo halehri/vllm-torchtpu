@@ -137,6 +137,29 @@ class GatedResidual(common_hc.GatedResidual):
         output = torch.cat(normalized, dim=-1)
         return (output * (1.0 + self.hc_norm.weight.float())).to(hyper_input.dtype)
 
+    @torch.no_grad()
+    def fake_quantize_fp8(self) -> list[float]:
+        """Debug only (VLLM_TPU_HC_FAKE_FP8): round-trip the projection weights
+        through FP8 e4m3 with per-output-channel scales, in place.
+
+        Same dtype and shape, so the served graphs are unchanged; it measures
+        the accuracy an FP8-weight HC would have. Returns each weight's max
+        per-channel relative error.
+        """
+        errors = []
+        for name in ("input_mix_weight_down", "input_mix_weight_up", "block_inject_weight"):
+            module = getattr(self, name, None)
+            if module is None:
+                continue
+            weight = module.weight
+            w = weight.detach().cpu().float()
+            scale = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / 448.0
+            q = (w / scale).to(torch.float8_e4m3fn).float() * scale
+            err = ((q - w).norm(dim=1) / w.norm(dim=1).clamp_min(1e-12)).max()
+            errors.append(float(err))
+            weight.copy_(q.to(weight.dtype).to(weight.device))
+        return errors
+
     def disable_decode_fused(self):
         """Keep the unfused mix at every token count.
 

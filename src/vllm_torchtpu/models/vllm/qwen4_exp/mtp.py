@@ -39,6 +39,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 from .config import mtp_layer_prefixes
@@ -390,4 +391,16 @@ class Qwen4ExpMTP(nn.Module):
         }
         if missing:
             raise ValueError(f"Incomplete Qwen4Exp MTP checkpoint: {sorted(missing)}")
+        if envs.VLLM_TPU_HC_FAKE_FP8:
+            errors = [
+                e
+                for m in self.modules()
+                if isinstance(m, GatedResidual)
+                for e in m.fake_quantize_fp8()
+            ]
+            print(
+                "MTP HC fake FP8: %d weights, max per-channel rel err %.4f, mean %.4f"
+                % (len(errors), max(errors, default=0.0), sum(errors) / max(len(errors), 1)),
+                flush=True,
+            )
         return set(parameters)

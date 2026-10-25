@@ -1048,6 +1048,18 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         }
         if missing:
             raise ValueError(f"Incomplete Qwen4Exp checkpoint: {sorted(missing)}")
+        if envs.VLLM_TPU_HC_FAKE_FP8:
+            errors = [
+                e
+                for m in self.modules()
+                if isinstance(m, GatedResidual)
+                for e in m.fake_quantize_fp8()
+            ]
+            print(
+                "target HC fake FP8: %d weights, max per-channel rel err %.4f, mean %.4f"
+                % (len(errors), max(errors, default=0.0), sum(errors) / max(len(errors), 1)),
+                flush=True,
+            )
         if identity is not None:
             self.pd_loaded_weight_identity = identity.finish()
             self.pd_loaded_ple_identity = identity.finish(name_fragment=".ple.")
