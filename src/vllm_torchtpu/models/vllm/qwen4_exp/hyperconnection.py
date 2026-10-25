@@ -78,6 +78,7 @@ class GatedResidual(common_hc.GatedResidual):
             )
         self._decode_mix_op = None
         self._decode_combine_mix_op = None
+        self._any_mix_op = None
         if (
             envs.TPU_QWEN4_HC_DECODE_FUSED
             and self.config.hc_per_branch_norm
@@ -135,7 +136,22 @@ class GatedResidual(common_hc.GatedResidual):
                 values * torch.rsqrt(variance + self.hc_norm.variance_epsilon)
             )
         output = torch.cat(normalized, dim=-1)
-        return (output * (1.0 + self.hc_norm.weight.float())).to(hyper_input.dtype)
+        scale = getattr(self, "hc_norm_scale", None)
+        if scale is None:
+            scale = 1.0 + self.hc_norm.weight.float()
+        return (output * scale).to(hyper_input.dtype)
+
+    def finalize_weights(self):
+        """Precompute the zero-centred norm scale ``1 + w`` in FP32 once.
+
+        Same values as computing it in every call (FP32 add of the BF16
+        weight), without the per-step add over [hc * H].
+        """
+        self.register_buffer(
+            "hc_norm_scale",
+            1.0 + self.hc_norm.weight.detach().float(),
+            persistent=False,
+        )
 
     def disable_decode_fused(self):
         """Keep the unfused mix at every token count.
@@ -144,6 +160,31 @@ class GatedResidual(common_hc.GatedResidual):
         fused path is chosen by the token count while tracing, so that one
         graph could not serve buckets on the other side of the choice.
         """
+        self._decode_mix_op = None
+        self._decode_combine_mix_op = None
+
+    def use_any_mix(self):
+        """Fused decode mix for a module traced once for every token bucket.
+
+        The MTP draft cannot pick the fused path by its token count while
+        tracing. This mix calls one op for every count, and the op picks the
+        fused decode kernel or plain JAX on its static row count.
+        """
+        if not (
+            self.config.hc_per_branch_norm
+            and self.hidden_size % 128 == 0
+            and hasattr(self, "input_mix_weight_down")
+        ):
+            self.disable_decode_fused()
+            return
+        from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import build_any_mix_op
+
+        self._any_mix_op = build_any_mix_op(
+            self.hc_count,
+            self.hidden_size,
+            self.hc_norm.variance_epsilon,
+            hasattr(self, "block_inject_weight"),
+        )
         self._decode_mix_op = None
         self._decode_combine_mix_op = None
 
@@ -190,6 +231,17 @@ class GatedResidual(common_hc.GatedResidual):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if not hasattr(self, "input_mix_weight_down"):
             raise RuntimeError("mix was disabled for this hyper-connection")
+        if (
+            getattr(self, "_any_mix_op", None) is not None
+            and hyper_input.dim() == 2
+            and hyper_input.dtype == torch.bfloat16
+            and all(w.dtype == torch.bfloat16 for w in self._decode_weights())
+        ):
+            out = self._any_mix_op(hyper_input, *self._decode_weights())
+            if hasattr(self, "block_inject_weight"):
+                mixed, injection = out
+                return mixed, (hyper_input, injection)
+            return out, (hyper_input, None)
         if self._decode_fused(hyper_input):
             out = self._decode_mix_op(hyper_input, *self._decode_weights())
             if hasattr(self, "block_inject_weight"):

@@ -9,7 +9,7 @@ import torch
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.qwen4_exp.gated_residual import gated_residual_fn
-from vllm_torchtpu.kernels.qwen4_exp.hc_decode import hc_decode_mix
+from vllm_torchtpu.kernels.qwen4_exp.hc_decode import hc_decode_mix, hc_mix_any
 from vllm_torchtpu.kernels.qwen4_exp.hc_full import _full_mix
 from vllm_torchtpu.kernels.qwen4_exp.hc_norm import _normalize
 from vllm_torchtpu.kernels.qwen4_exp.hc_up import _up_epilogue
@@ -138,6 +138,47 @@ def build_decode_mix_op(branches: int, hidden: int, eps: float, inject: bool):
 
     op = pallas.jax_op(
         f"qwen4_exp::hc_decode_c{branches}_h{hidden}_e{eps_tag}"
+        f"{'_inj' if inject else ''}_v1",
+        core,
+    )
+
+    def mixed_like(x):
+        return x.new_empty((x.shape[0], hidden), dtype=torch.bfloat16)
+
+    if inject:
+
+        @op.register_fake
+        def fake(x, weight, down, up, inject_weight):
+            gate = x.new_empty((x.shape[0], branches), dtype=torch.float32)
+            return mixed_like(x), gate
+
+    else:
+
+        @op.register_fake
+        def fake(x, weight, down, up):
+            return mixed_like(x)
+
+    return op
+
+
+@functools.cache
+def build_any_mix_op(branches: int, hidden: int, eps: float, inject: bool):
+    """The HC mix for any row count: the fused decode kernel where it applies,
+    plain JAX otherwise, chosen inside the op (see ``hc_mix_any``)."""
+    eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
+    static = dict(branches=branches, hidden=hidden, eps=eps)
+    if inject:
+
+        def core(x, weight, down, up, inject_weight):
+            return hc_mix_any(x, weight, down, up, inject_weight, **static)
+
+    else:
+
+        def core(x, weight, down, up):
+            return hc_mix_any(x, weight, down, up, **static)[0]
+
+    op = pallas.jax_op(
+        f"qwen4_exp::hc_mix_any_c{branches}_h{hidden}_e{eps_tag}"
         f"{'_inj' if inject else ''}_v1",
         core,
     )

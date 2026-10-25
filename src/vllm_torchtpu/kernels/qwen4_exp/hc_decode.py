@@ -337,3 +337,57 @@ def _hc_decode_mix(
     if prologue:
         return mixed, injection, outs[-1]
     return mixed, injection
+
+
+def hc_mix_reference(x, weight, down, up, inject_weight=None, *, branches, hidden, eps):
+    """The unfused HC mix (``GatedResidual.mix`` without kernels) in plain JAX.
+
+    Same rounding boundaries as the torch path: per-branch RMS norm in FP32
+    scaled by ``1 + w`` and rounded to BF16, BF16 projections with FP32
+    accumulation rounded to BF16, FP32 SiLU and sigmoid, FP32 branch mean
+    rounded to BF16. Returns ``(mixed, injection)`` like ``hc_decode_mix``.
+    """
+    f32 = jnp.float32
+    flat = x.astype(f32)
+    parts = []
+    for branch in range(branches):
+        values = flat[:, branch * hidden : (branch + 1) * hidden]
+        variance = jnp.mean(values * values, axis=-1, keepdims=True)
+        parts.append(values * jax.lax.rsqrt(variance + eps))
+    norm = (jnp.concatenate(parts, axis=-1) * (1.0 + weight.astype(f32))).astype(
+        jnp.bfloat16
+    )
+
+    def linear(a, w):
+        return jnp.dot(a, w.T, preferred_element_type=f32).astype(jnp.bfloat16)
+
+    gate = (linear(norm, down) / branches).astype(jnp.bfloat16)
+    gate = jax.nn.silu(gate.astype(f32)).astype(jnp.bfloat16)
+    gate = jax.nn.sigmoid(linear(gate, up).astype(f32))
+    weighted = gate * norm.astype(f32)
+    mixed = weighted[:, :hidden]
+    for branch in range(1, branches):
+        mixed = mixed + weighted[:, branch * hidden : (branch + 1) * hidden]
+    mixed = (mixed / branches).astype(jnp.bfloat16)
+    injection = None
+    if inject_weight is not None:
+        injection = 2.0 * jax.nn.sigmoid(
+            linear(norm, inject_weight).astype(f32) / branches
+        )
+    return mixed, injection
+
+
+def hc_mix_any(x, weight, down, up, inject_weight=None, *, branches, hidden, eps):
+    """``hc_decode_mix`` where it applies, else ``hc_mix_reference``.
+
+    The choice is made on the static row count inside the op, so a torch graph
+    traced once for every token bucket (the MTP draft) calls one op for all of
+    them.
+    """
+    if decode_token_tile(x.shape[0]) is not None:
+        return hc_decode_mix(
+            x, weight, down, up, inject_weight, branches=branches, hidden=hidden, eps=eps
+        )[:2]
+    return hc_mix_reference(
+        x, weight, down, up, inject_weight, branches=branches, hidden=hidden, eps=eps
+    )

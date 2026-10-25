@@ -39,6 +39,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 from .config import mtp_layer_prefixes
@@ -166,9 +167,15 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         # token count while tracing).
         for layer in self.layers:
             layer.self_attn.single_graph = True
+        # With TPU_QWEN4_HC_DECODE_FUSED_DRAFT the draft's HCs call one mix op
+        # for every bucket, which picks the fused kernel on its static row count.
+        draft_fused = envs.TPU_QWEN4_HC_DECODE_FUSED and envs.TPU_QWEN4_HC_DECODE_FUSED_DRAFT
         for module in self.modules():
             if isinstance(module, GatedResidual):
-                module.disable_decode_fused()
+                if draft_fused:
+                    module.use_any_mix()
+                else:
+                    module.disable_decode_fused()
         # Set by the Qwen3.8 megakernel driver before the first trace: the
         # layer's o_proj, both HCs and the MoE as one tail-kernel call.
         self.mk_tail: nn.Module | None = None
@@ -390,4 +397,7 @@ class Qwen4ExpMTP(nn.Module):
         }
         if missing:
             raise ValueError(f"Incomplete Qwen4Exp MTP checkpoint: {sorted(missing)}")
+        for module in self.modules():
+            if isinstance(module, GatedResidual):
+                module.finalize_weights()
         return set(parameters)
