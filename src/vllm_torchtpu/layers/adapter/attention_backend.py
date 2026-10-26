@@ -21,8 +21,11 @@ registered name selected the layers run RPA (FLASH_ATTN), or batched
 RPA (CUSTOM).
 """
 
-from typing import TYPE_CHECKING
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, ClassVar
 
+import numpy as np
 from vllm import envs as vllm_envs
 from vllm.ray.lazy_utils import is_in_ray_actor
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -30,16 +33,73 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm_torchtpu import envs
 
 if TYPE_CHECKING:
+    import torch
     from vllm.config import VllmConfig
 
 
-_REGISTERED_BACKENDS: set[str] = set()
+@dataclass(frozen=True)
+class HostStepInputs:
+    """The host arrays TPUModelRunner._prepare_inputs filled for one step,
+    requests in kernel order (decode first); block_tables and page_sizes are
+    keyed by attention KV cache group id."""
+
+    num_decode: int
+    # i32[num_reqs + 1] query starts; i32[num_reqs] kv lengths incl. this step.
+    query_start_loc: np.ndarray
+    seq_lens: np.ndarray
+    # i32[num_reqs, pages_per_seq] kernel page ids.
+    block_tables: Mapping[int, np.ndarray]
+    page_sizes: Mapping[int, int]
+    num_tokens: int
+    max_num_seqs: int
+    # The largest token bucket. One backbone trace serves every bucket, so a
+    # backend array's shape may follow max_num_tokens, never num_tokens.
+    max_num_tokens: int
 
 
-def register_attention_backend(name: str, *, vllm_backend: str) -> None:
+class TPUAttentionBackend:
+    """The runner side of an attention backend. This base does nothing and is
+    what FLASH_ATTN and CUSTOM get; a backend with per-step metadata sets
+    has_step_metadata and overrides prepare_step and warmup_metadata."""
+
+    has_step_metadata: ClassVar[bool] = False
+
+    def check_config(self, vllm_config: "VllmConfig") -> None:
+        """Raise for a configuration the backend cannot serve; it may adjust
+        it, e.g. the block size."""
+
+    def prepare_step(
+        self, step: HostStepInputs, device: "torch.device"
+    ) -> Mapping[int, Any]:
+        """Device metadata of one step per KV cache group id, passed to the
+        layers as AttentionMetadata.backend_metadata."""
+        raise NotImplementedError
+
+    def warmup_metadata(
+        self,
+        page_sizes: Mapping[int, int],
+        *,
+        max_num_seqs: int,
+        max_num_tokens: int,
+        device: "torch.device",
+    ) -> Mapping[int, Any]:
+        """prepare_step's output for a warmup step: same structure and shapes,
+        doing no work."""
+        raise NotImplementedError
+
+
+_REGISTERED_BACKENDS: dict[str, Callable[[], TPUAttentionBackend]] = {}
+
+
+def register_attention_backend(
+    name: str,
+    *,
+    vllm_backend: str,
+    attention: Callable[[], TPUAttentionBackend] = TPUAttentionBackend,
+) -> None:
     """Make --attention-backend <name> run vllm_backend, the class path of the
     vLLM attention backend the attention layers get, a PallasAttentionBackend
-    subclass.
+    subclass. attention makes the runner's TPUAttentionBackend.
 
     Call it from a vllm.general_plugins entry point, which vLLM runs in every
     process before it parses --attention-backend, and may run more than once
@@ -53,7 +113,7 @@ def register_attention_backend(name: str, *, vllm_backend: str) -> None:
             f"vLLM already has an attention backend named {name.upper()}, at "
             f"{member.get_path()}."
         )
-    _REGISTERED_BACKENDS.add(name)
+    _REGISTERED_BACKENDS[name] = attention
 
 
 def is_registered_attention_backend(backend: AttentionBackendEnum | None) -> bool:
@@ -61,9 +121,18 @@ def is_registered_attention_backend(backend: AttentionBackendEnum | None) -> boo
     return backend is not None and backend.name.lower() in _REGISTERED_BACKENDS
 
 
+def create_attention_backend(vllm_config: "VllmConfig") -> TPUAttentionBackend:
+    """The runner's TPUAttentionBackend for the selected backend."""
+    backend = vllm_config.attention_config.backend
+    if not is_registered_attention_backend(backend):
+        return TPUAttentionBackend()
+    assert backend is not None
+    return _REGISTERED_BACKENDS[backend.name.lower()]()
+
+
 def check_attention_backend_config(vllm_config: "VllmConfig") -> None:
     """Raise if a registered backend is selected for an engine whose processes
-    cannot rebuild its name.
+    cannot rebuild its name, or its check_config rejects the configuration.
 
     Enum members pickle by value, so a spawned or Ray process, which unpickles
     vllm_config before it loads the plugins, cannot rebuild a registered
@@ -95,3 +164,4 @@ def check_attention_backend_config(vllm_config: "VllmConfig") -> None:
             f"--attention-backend {name} supports a single host with forked "
             f"processes only, not: {', '.join(reasons)}."
         )
+    _REGISTERED_BACKENDS[name]().check_config(vllm_config)

@@ -276,6 +276,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/kernels",
     "vllm_torchtpu/layers/core",
     "vllm_torchtpu/layers/adapter/attention.py",
+    "vllm_torchtpu/layers/adapter/flywheel_attention.py",
     "vllm_torchtpu/layers/adapter/cp_attention.py",
     "vllm_torchtpu/layers/adapter/custom_ops",
     "vllm_torchtpu/layers/adapter/fused_moe.py",
