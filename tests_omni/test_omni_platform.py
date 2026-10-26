@@ -18,8 +18,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from diffusers.pipelines.ltx2.vocoder import UpSample1d
-from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion import ipc
+from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
+from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 from vllm_omni.diffusion.models.ltx2 import (
@@ -28,12 +29,13 @@ from vllm_omni.diffusion.models.ltx2 import (
     ltx2_transformer,
 )
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
-from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
+    ColumnParallelGELU,
     WanSelfAttention,
 )
+from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
 
-from vllm_torchtpu.omni import register_omni_tpu_platform
+from vllm_torchtpu.omni import patches, register_omni_tpu_platform
 from vllm_torchtpu.omni import rope as omni_rope
 from vllm_torchtpu.omni.attention import (
     TpuFlashAttentionBackend,
@@ -174,9 +176,6 @@ def test_rope_patch_accepts_token_major_tables():
 
 
 def test_tpu_flash_attention_backend(monkeypatch):
-    from types import SimpleNamespace
-    from unittest.mock import MagicMock
-
     assert TpuFlashAttentionBackend.get_name() == "TPU_FLASH_ATTN"
     assert TpuFlashAttentionBackend.get_impl_cls() is TpuFlashAttentionImpl
 
@@ -244,12 +243,6 @@ def test_tpu_flash_attention_backend(monkeypatch):
 def test_wan_ffn_gelu_fence(monkeypatch):
     # The Wan FFN returns the GELU output passed through the XLA
     # optimization barrier (its result must be used, or XLA drops it).
-    from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
-        ColumnParallelGELU,
-    )
-
-    from vllm_torchtpu.omni import patches
-
     apply_omni_model_specific_patches()
     # Skip __init__ (ColumnParallelLinear requires an initialized TP group).
     ffn = object.__new__(ColumnParallelGELU)
@@ -463,8 +456,6 @@ def test_omni_tpu_patches_configuration():
 def test_startup_warmup_device_sync(monkeypatch):
     # The startup warmup must be followed by a device sync so that its pending
     # deferred TPU ops are not fused into the first request.
-    from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
-
     calls = []
 
     monkeypatch.setattr(
