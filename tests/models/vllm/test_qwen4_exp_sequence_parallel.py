@@ -180,21 +180,35 @@ class SplitMoE(nn.Module):
         return self.tp.total(self._shared_partial(block)) + self.routed(block, logits)
 
 
-class ReplicatedSplitMoE(SplitMoE):
-    """SplitMoE with the whole shared expert on every rank
-    (QWEN4_EXP_SP_REPLICATED_SHARED_EXPERT)."""
+class SharedMLP:
+    """A gated SiLU shared expert, TP-sliced over its intermediate dim."""
 
-    def __init__(self, tp, weight):
+    def __init__(self, tp, gate_up, down, gate):
+        self.tp, self.gate_up, self.down = tp, gate_up, down
+        self.act_fn = lambda x: torch.nn.functional.silu(x[:, : x.shape[1] // 2]) * x[
+            :, x.shape[1] // 2 :
+        ]
+        self.expert_gate = lambda x: (x @ gate.T, None)
+
+    def __call__(self, block):
+        inter = self.down.shape[1]
+        part = inter // self.tp.size
+        cols = slice(self.tp.rank * part, (self.tp.rank + 1) * part)
+        gu = torch.cat([self.gate_up[:inter][cols], self.gate_up[inter:][cols]])
+        out = self.act_fn(block @ gu.T) @ self.down[:, cols].T
+        return torch.sigmoid(self.expert_gate(block)[0]) * out
+
+
+class MlpSplitMoE(SplitMoE):
+    """SplitMoE whose TP-sliced shared expert is a real gated MLP."""
+
+    def __init__(self, tp, weight, gate_up, down, gate):
         super().__init__(tp, weight)
-        self.replicate_shared_expert = True
-        self.shared_expert = self._shared_full
-
-    def _shared_full(self, block):
-        return torch.sin(block.float() @ self.weight).to(block.dtype)
+        self.shared_expert = SharedMLP(tp, gate_up, down, gate)
 
     def forward(self, block):
         logits, _ = self.gate(block)
-        return self._shared_full(block) + self.routed(block, logits)
+        return self.tp.total(self.shared_expert(block)) + self.routed(block, logits)
 
 
 def make_layer(tp, layer_type, attn_hc, mlp_hc, attn_weight, moe_weight):
@@ -246,6 +260,10 @@ def test_decoder_layer_sequence_parallel_matches_tp(
     attn_hc, mlp_hc = hc_module(), hc_module()
     attn_w = torch.randn(HIDDEN, HIDDEN) / HIDDEN**0.5
     moe_w = torch.randn(HIDDEN, HIDDEN) / HIDDEN**0.5
+    inter = 8
+    gate_up_w = (torch.randn(2 * inter, HIDDEN) / HIDDEN**0.5).bfloat16()
+    down_w = (torch.randn(HIDDEN, inter) / inter**0.5).bfloat16()
+    gate_w = (torch.randn(1, HIDDEN) / HIDDEN**0.5).bfloat16()
     hidden = torch.randn(TOKENS, HC * HIDDEN).bfloat16()
     input_ids = torch.zeros(TOKENS, dtype=torch.long)
     valid = torch.arange(TOKENS) < TOKENS - 5  # trailing padding rows
@@ -254,8 +272,14 @@ def test_decoder_layer_sequence_parallel_matches_tp(
 
     def run(rank, sequence_parallel):
         layer = make_layer(tp2, layer_type, attn_hc, mlp_hc, attn_w, moe_w)
-        moe = ReplicatedSplitMoE if split_moe == "replicated_shared" else SplitMoE
-        layer.mlp = moe(tp2, moe_w)
+        if split_moe == "replicated_shared":
+            layer.mlp = MlpSplitMoE(tp2, moe_w, gate_up_w, down_w, gate_w)
+            if sequence_parallel:
+                # The whole copy the SP MoE uses (filled by load_weights).
+                layer.register_buffer("sp_shared_gate_up", gate_up_w)
+                layer.register_buffer("sp_shared_down", down_w)
+        else:
+            layer.mlp = SplitMoE(tp2, moe_w)
         layers[rank] = layer
         x = tp2.shard(hidden) if sequence_parallel else hidden
         pad = sp_pad if sequence_parallel else 0
@@ -289,7 +313,9 @@ def test_decoder_layer_sequence_parallel_matches_tp(
     joined = torch.cat(sharded, dim=0)
     assert joined.shape == replicated[0].shape
     rows = valid
-    torch.testing.assert_close(joined[rows], replicated[0][rows], rtol=0, atol=0)
+    # The whole shared expert is one matmul, not a sum of TP partials.
+    tol = 2e-2 if split_moe == "replicated_shared" else 0
+    torch.testing.assert_close(joined[rows], replicated[0][rows], rtol=tol, atol=tol)
     expected_calls = [("_adaptive_fused_moe_op_sp", TOKENS // 2)] * 2
     assert calls == (expected_calls if split_moe else [])
 

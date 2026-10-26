@@ -840,8 +840,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # shared expert on every TP rank, so the sequence-parallel MoE runs it on
     # the rank's own rows instead of all-gathering its input and
     # reduce-scattering its output (one bf16 [T, hidden] all-gather and one
-    # reduce-scatter per layer). Other steps run the replicated shared expert
-    # on all rows, as upstream does for a misaligned TP split.
+    # reduce-scatter per layer). Other steps keep the TP-sliced shared expert
+    # (the fused MoE decode kernel serves it); the whole copy costs
+    # 3 * hidden * shared_intermediate BF16 per layer.
     "QWEN4_EXP_SP_REPLICATED_SHARED_EXPERT": env_bool(
         "QWEN4_EXP_SP_REPLICATED_SHARED_EXPERT", default=False
     ),

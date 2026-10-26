@@ -245,25 +245,24 @@ class Qwen4ExpDecoderLayer(nn.Module):
             cfg.compilation_config.static_forward_context[prefix + ".self_attn"] = (
                 self.self_attn
             )
+        self.mlp = Qwen3NextSparseMoeBlock(vllm_config=cfg, prefix=prefix + ".mlp")
         if envs.QWEN4_EXP_SP_REPLICATED_SHARED_EXPERT and sp.enabled(tp.world_size):
-            # Full shared-expert weights on every rank (as upstream does for a
-            # misaligned TP split): the sequence-parallel MoE then runs the
-            # shared expert on this rank's rows, with no all-gather or
-            # reduce-scatter of its input and output.
-            from vllm.model_executor.models import qwen3_next
-
-            original = qwen3_next._should_replicate_misaligned_shared_expert
-            qwen3_next._should_replicate_misaligned_shared_expert = (
-                lambda *args, **kwargs: True
-            )
-            try:
-                self.mlp = Qwen3NextSparseMoeBlock(
-                    vllm_config=cfg, prefix=prefix + ".mlp"
+            # The whole shared expert (gate rows then up rows; down) for the
+            # sequence-parallel MoE, filled from the checkpoint in
+            # load_weights. Other steps keep the runner's TP-sliced one, which
+            # the fused MoE decode kernel serves.
+            inter = int(t.shared_expert_intermediate_size)
+            with torch.device(cfg.device_config.device):
+                self.register_buffer(
+                    "sp_shared_gate_up",
+                    torch.zeros(2 * inter, int(t.hidden_size), dtype=torch.bfloat16),
+                    persistent=False,
                 )
-            finally:
-                qwen3_next._should_replicate_misaligned_shared_expert = original
-        else:
-            self.mlp = Qwen3NextSparseMoeBlock(vllm_config=cfg, prefix=prefix + ".mlp")
+                self.register_buffer(
+                    "sp_shared_down",
+                    torch.zeros(int(t.hidden_size), inter, dtype=torch.bfloat16),
+                    persistent=False,
+                )
         hc_up_tile = int(
             cfg.additional_config.get("qwen4_exp", {}).get("hc_prefill_up_tile", 0)
         )
@@ -412,7 +411,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         routed experts take this rank's rows directly and the TP-sliced
         shared expert's partial sum is reduce-scattered: the same terms
         MoERunner adds, (all-reduced shared) + (routed). A replicated shared
-        expert (QWEN4_EXP_SP_REPLICATED_SHARED_EXPERT) runs on this rank's
+        expert copy (QWEN4_EXP_SP_REPLICATED_SHARED_EXPERT) runs on this rank's
         rows instead. Otherwise the block
         runs on the gathered rows (its EP kernel takes replicated rows and
         returns them reduced) and this rank keeps its rows.
@@ -420,13 +419,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
         mlp = self.mlp
         routed = getattr(getattr(mlp, "experts", None), "routed_experts", None)
         method = getattr(routed, "quant_method", None)
-        replicated = getattr(mlp, "replicate_shared_expert", None)
         if (
             not envs.QWEN4_EXP_PREFILL_SP_MOE
             or getattr(method, "_adaptive_fused_moe_op_sp", None) is None
             or getattr(mlp, "shared_expert", None) is None
-            or replicated is None
-            or (replicated and not envs.QWEN4_EXP_SP_REPLICATED_SHARED_EXPERT)
+            or getattr(mlp, "replicate_shared_expert", True)
         ):
             return sp.shard(mlp(sp.gather(block, num_tokens)))
         from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
@@ -447,9 +444,13 @@ class Qwen4ExpDecoderLayer(nn.Module):
             router_logits,
             attr="_adaptive_fused_moe_op_sp",
         )
-        if replicated:
+        if hasattr(self, "sp_shared_down"):
             # QWEN4_EXP_SP_REPLICATED_SHARED_EXPERT: whole shared expert, own rows.
-            return mlp.shared_expert(block) + output
+            shared = mlp.shared_expert
+            out = shared.act_fn(block @ self.sp_shared_gate_up.T) @ self.sp_shared_down.T
+            if shared.expert_gate is not None:
+                out = torch.sigmoid(shared.expert_gate(block)[0]) * out
+            return out + output
         shared = sp.reduce(mlp.shared_expert(sp.gather(block, num_tokens)), True)
         return shared + output
 
@@ -1015,6 +1016,22 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 _, _, idx, family, relative = name.split(".", 4)
                 layer = layers[int(idx)]
                 if family == "mlp":
+                    if hasattr(layer, "sp_shared_down") and relative.startswith(
+                        "shared_expert."
+                    ):
+                        if weight.dtype != torch.bfloat16:
+                            raise ValueError(
+                                "QWEN4_EXP_SP_REPLICATED_SHARED_EXPERT needs a BF16 "
+                                f"shared expert, got {original} {weight.dtype}"
+                            )
+                        full = layer.sp_shared_gate_up
+                        rows = full.shape[0] // 2
+                        if relative == "shared_expert.gate_proj.weight":
+                            full[:rows].copy_(weight)
+                        elif relative == "shared_expert.up_proj.weight":
+                            full[rows:].copy_(weight)
+                        elif relative == "shared_expert.down_proj.weight":
+                            layer.sp_shared_down.copy_(weight)
                     targets = moe_loaders[int(idx)].load_weights(
                         iter([(relative, weight)]), mapper=moe_mapper
                     )
