@@ -3118,11 +3118,14 @@ class TestStorageBackendConfigs(unittest.TestCase):
             tp_rank=1, tp_size=2, pcp_rank=3, pcp_size=4, pp_rank=1, pp_size=2
         )
         self.assertEqual((coords.storage_rank, coords.storage_size), (15, 16))
-        # Every (PP, PCP, TP) tuple gets a distinct storage_rank.
+        # The shard a rank writes is its index among the engine's workers.
+        self.assertEqual(coords.engine_rank, coords.storage_rank)
+        # Every (PP, PCP, TP) tuple gets a distinct engine rank, and the
+        # ranks fill [0, world_size).
         ranks = sorted(
             rs.StorageRankCoords(
                 tp, 2, pcp_rank=pcp, pcp_size=4, pp_rank=pp, pp_size=2
-            ).storage_rank
+            ).engine_rank
             for pp in range(2)
             for pcp in range(4)
             for tp in range(2)

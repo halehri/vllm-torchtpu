@@ -2087,18 +2087,27 @@ class StorageRankCoords:
                 )
 
     @property
-    def storage_rank(self) -> int:
-        """Which of a block's shard files this rank writes.
+    def engine_rank(self) -> int:
+        """This rank's index among its engine's workers, in [0, world_size).
 
-        Also the rank's index among its engine's workers: vLLM lays an
-        engine's ranks out PP x PCP x TP, the same order, so this is the
-        engine-local rank the store registers the worker under (node_id).
+        vLLM lays an engine's ranks out PP x PCP x TP, so that is the group
+        coordinates in the same order. The store registers the worker under
+        it (node_id) and pairs P2P transfers on it -- this replica's worker k
+        reads from the peer's worker k -- so it must name the same KV shard
+        on every replica. The world rank does not: under data parallelism
+        with expert parallelism the torch.distributed world spans every
+        replica, making it `dp_rank * world_size + k`.
         """
         return (
             self.pp_rank * (self.pcp_size * self.tp_size)
             + self.pcp_rank * self.tp_size
             + self.tp_rank
         )
+
+    @property
+    def storage_rank(self) -> int:
+        """Which of a block's shard files this rank writes: its engine rank."""
+        return self.engine_rank
 
     @property
     def storage_size(self) -> int:
@@ -2109,9 +2118,8 @@ class StorageRankCoords:
 def worker_storage_rank_coords() -> StorageRankCoords:
     """This worker's storage coordinates, read from its TP, PCP, and PP groups.
 
-    Not from the world rank: with data parallelism that counts the ranks of
-    every replica, while storage paths, and the node id the store knows the
-    worker by, are per TP, PCP, and PP rank.
+    Not from the world rank, which under data parallelism counts every
+    replica's ranks; see `StorageRankCoords.engine_rank`.
     """
     from vllm.distributed import parallel_state
 
@@ -2434,18 +2442,8 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
 
     def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
         if self._worker is None:
-            # The worker's index within its engine, [0, world_size), from its
-            # TP, PCP, and PP group ranks: PP -> PCP -> TP major, the order
-            # vLLM lays an engine's ranks out in, so it is the engine-local
-            # rank and the storage shard index alike. The store registers the
-            # worker under it (node_id) and pairs transfers with a peer store
-            # on it -- this replica's worker k reads from the peer's worker k
-            # -- so k must name the same shard on every replica. Not the
-            # world group's rank: under data parallelism (DP + EP shares one
-            # torch.distributed world across the replicas) that is the global
-            # `dp_rank * world_size + k`, which the store -- one per replica,
-            # expecting node ids [0, world_size) -- rejects on every replica
-            # but the first once a global registry is configured.
+            # The worker's index within its engine, not its world rank: see
+            # StorageRankCoords.engine_rank.
             coords = worker_storage_rank_coords()
             # The store expects node ids in [0, world_size) and, with a
             # storage tier, looks for a block's files under the shard count
@@ -2461,7 +2459,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 f"configured TP={self.tp_size}, PCP={self.pcp_size}, "
                 f"PP={self.pp_size}"
             )
-            rank = coords.storage_rank
+            rank = coords.engine_rank
             # Direct workers to dial the controller on store_server_ip when configured
             # (bind-and-advertise), falling back to loopback (127.0.0.1) for local runs.
             controller_address = (
@@ -2477,10 +2475,9 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                     )
                 )
                 logger.info(
-                    "TPURaidenOffloadingConnector: worker %d writes storage shard "
-                    "%d of %d (TP rank %d, PCP rank %d, PP rank %d) under %s",
+                    "TPURaidenOffloadingConnector: worker %d of %d writes its "
+                    "storage shard (TP rank %d, PCP rank %d, PP rank %d) under %s",
                     rank,
-                    coords.storage_rank,
                     coords.storage_size,
                     coords.tp_rank,
                     coords.pcp_rank,
