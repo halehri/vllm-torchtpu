@@ -622,10 +622,17 @@ def adaptive_fused_moe(
             # MOE_ADAPTIVE_PREGATHER: this shard's slab rows in slab order, one
             # gather here instead of one kernel DMA per row; padded by a tile
             # so a tile's contiguous copy never runs past the end.
-            q_g = jnp.pad(
-                jnp.take(q_g, token_gather[:ragged_stride], axis=0),
-                ((0, capacity), (0, 0), (0, 0)),
+            # Gathered as 32-bit words (the same bytes): XLA's row gather is
+            # markedly faster on 32-bit rows than on fp8 ones. The index is
+            # padded rather than the gathered rows, so no extra copy follows.
+            idx = jnp.pad(token_gather[:ragged_stride], (0, capacity))
+            lanes = q_g.shape[1:]
+            words = lax.bitcast_convert_type(
+                q_g.reshape(q_g.shape[0], -1, 4), jnp.int32
             )
+            q_g = lax.bitcast_convert_type(
+                jnp.take(words, idx, axis=0), q_g.dtype
+            ).reshape(idx.shape[0], *lanes)
         arrivals, arrival_scales = kfn(
             kernel_tables,
             token_gather,
