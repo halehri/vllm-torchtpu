@@ -82,9 +82,15 @@ def _static_shape_args(fn):
                 return a[:]
             return a
 
-        return fn(
-            *[unmark(a) for a in args], **{k: unmark(v) for k, v in kwargs.items()}
-        )
+        # Dynamo guards each compiled entry on the global grad mode. The
+        # draft regions are reached from execute_model (no_grad) and from
+        # sample_tokens and the precompile (grad enabled); run them under one
+        # mode so a warmed shape never recompiles on a served call.
+        with torch.no_grad():
+            return fn(
+                *[unmark(a) for a in args],
+                **{k: unmark(v) for k, v in kwargs.items()},
+            )
 
     return wrapper
 
