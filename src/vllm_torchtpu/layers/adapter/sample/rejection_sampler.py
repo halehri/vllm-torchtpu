@@ -142,10 +142,10 @@ class RejectionSampler:
             path. The caller passes False only when no request sets top-k or
             top-p, where the two 31-step bisections over the vocabulary are
             the identity (7.5 ms per 512 rows on Flash). A separate graph.
-          draft_probs: [num_tokens, vocab] float32 distribution each draft
-            token was sampled from (probabilistic drafting). None treats the
-            draft as one-hot (greedy drafting). Used by the non-greedy path;
-            the greedy and synthetic decisions ignore it.
+          draft_probs: float32 distribution each draft token was sampled
+            from (probabilistic drafting), shaped like target_logits. None
+            treats the draft as one-hot (greedy drafting). Used by the
+            non-greedy path; the greedy and synthetic decisions ignore it.
 
         Returns:
           A tensor of shape [batch_size, max_draft_tokens + 1] containing the
@@ -167,6 +167,14 @@ class RejectionSampler:
                 raise ValueError(
                     "Non-greedy rejection sampling requires temperatures, "
                     "top_k, top_p, accept_u, and recover_u."
+                )
+            # Checked eagerly: a mismatched q otherwise fails inside the
+            # compiled graph with an opaque tracing error, or, e.g. [rows, 1],
+            # broadcasts in p - q and returns wrong tokens.
+            if draft_probs is not None and draft_probs.shape != target_logits.shape:
+                raise ValueError(
+                    f"draft_probs shape {tuple(draft_probs.shape)} does not "
+                    f"match target_logits shape {tuple(target_logits.shape)}."
                 )
             if draft_probs is not None and self.synthetic_mode:
                 # As upstream, the synthetic schedule decides acceptance; q

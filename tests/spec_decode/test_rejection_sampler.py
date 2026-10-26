@@ -1164,6 +1164,32 @@ def test_rejection_sampler_random_draft_probs_zero_q_rejects(device):
     assert output.tolist() == [[2, -1]]
 
 
+@pytest.mark.parametrize("q_shape", [(1, 3), (1, 2, 3), (2, 1)])
+def test_rejection_sampler_random_draft_probs_shape_mismatch_raises(device, q_shape):
+    """q not shaped like target_logits raises eagerly. Unpadded rows and
+    [batch, k, vocab] would otherwise fail inside the compiled graph with an
+    opaque error; [rows, 1] would broadcast and return wrong tokens."""
+    sampler = RejectionSampler()
+    target_logits = torch.zeros((2, 3), device=device)
+    with pytest.raises(ValueError, match="does not match target_logits"):
+        sampler(
+            draft_token_ids=torch.tensor([0, 1], dtype=torch.int32, device=device),
+            num_draft_tokens=torch.tensor([2], dtype=torch.int32, device=device),
+            target_logits=target_logits,
+            bonus_token_ids=torch.tensor([9], dtype=torch.int32, device=device),
+            segment_ids=torch.tensor([0, 0], dtype=torch.int64, device=device),
+            group_indices=torch.tensor([0, 1], dtype=torch.int64, device=device),
+            max_draft_tokens=2,
+            temperatures=torch.ones((2, 1), dtype=torch.float32, device=device),
+            top_k=torch.zeros((2, 1), dtype=torch.int32, device=device),
+            top_p=torch.ones((2, 1), dtype=torch.float32, device=device),
+            accept_u=torch.full((2,), 0.5, dtype=torch.float32, device=device),
+            recover_u=torch.full_like(target_logits, 0.5),
+            do_sampling=True,
+            draft_probs=torch.full(q_shape, 1 / 3, device=device),
+        )
+
+
 def test_rejection_sampler_greedy_path_ignores_draft_probs(device):
     """As upstream: the greedy path verifies by argmax match, so draft_probs
     does not change its decision; the caller is warned once."""
