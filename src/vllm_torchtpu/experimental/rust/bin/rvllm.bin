@@ -1,0 +1,248 @@
+#!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Serves a model with the native Rust runtime (rvllm) behind the `vllm serve`
+# command line:
+#
+#   rvllm.bin serve <model> [vllm serve arguments]
+#
+# exports the model with `python -m vllm_torchtpu.experimental.export` (once;
+# the artifact is cached by model, export arguments and exporter source) and
+# then runs `rvllm serve <artifact>` with the deployment flags. Arguments that
+# configure the server (--host, --port, --served-model-name, the disaggregation
+# flags, ...) go to rvllm; every other argument goes to the exporter, which
+# records it in the artifact. Other subcommands (bench, proxy, --version) run
+# the rvllm binary directly.
+#
+# The rvllm binary is not part of this repository. Point to it with one of:
+#   RVLLM_BINARY=/path/to/rvllm       a local binary, used as is
+#   RVLLM_BINARY_URL=<location>       a directory holding `rvllm` and its
+#                                     `metadata.json` (with a "sha256" entry):
+#                                     gs://..., https://... or a local path.
+#                                     The binary is checked against the sha256
+#                                     and cached under RVLLM_CACHE_DIR.
+# Optional:
+#   RVLLM_BINARY_SHA256    expected sha256 (overrides metadata.json)
+#   RVLLM_CACHE_DIR        cache root (default: ~/.cache/rvllm)
+#   RVLLM_ARTIFACT_DIR     use this exported artifact instead of exporting
+#   PYTHON                 interpreter for the exporter (default: python3)
+
+set -euo pipefail
+
+CACHE_DIR="${RVLLM_CACHE_DIR:-${HOME}/.cache/rvllm}"
+PYTHON="${PYTHON:-python3}"
+
+die() {
+    echo "rvllm.bin: error: $*" >&2
+    exit 1
+}
+
+# Flags of `rvllm serve` (its deployment options). They configure the server,
+# not the model, so they are not passed to the exporter.
+SERVE_VALUE_FLAGS=(
+    --host --port --served-model-name
+    --max-queued-requests --max_queued_requests --shutdown-timeout --shutdown_timeout
+    --structured-decoding-mode --structured_decoding_mode
+    --role --kv-role --kv_role --kv-port --kv_port --kv-transfer-port
+    --kv-listen --kv_listen --kv-teleport-listen --kv-advertise --kv_advertise
+    --kv-producers --kv_producers
+    --debug-max-blocks --debug_max_blocks --pjrt-cpu-device-count --pjrt_cpu_device_count
+    --prompt --max-tokens --max_tokens
+)
+SERVE_BOOL_FLAGS=(
+    --async-scheduling --async_scheduling --no-async-scheduling --no_async_scheduling
+    --debug-dummy-weight --debug_dummy_weight --debug-dummy-compute --debug_dummy_compute
+)
+# Flags both sides read: the exporter writes dummy weights for
+# `--load-format dummy`, and rvllm then loads none.
+SHARED_VALUE_FLAGS=(--load-format --load_format)
+
+# Whether $1 is one of the remaining arguments.
+is_one_of() {
+    local needle="$1" x
+    shift
+    for x in "$@"; do
+        [ "${x}" = "${needle}" ] && return 0
+    done
+    return 1
+}
+
+sha256_of() {
+    sha256sum "$1" | cut -d' ' -f1
+}
+
+# Copies `<location>/<name>` to `<dest>`; location is gs://, https:// or a path.
+fetch() {
+    local location="$1" name="$2" dest="$3"
+    case "${location}" in
+        gs://*)
+            command -v gcloud >/dev/null || die "gcloud is needed to download from ${location}"
+            gcloud --no-user-output-enabled storage cp "${location%/}/${name}" "${dest}"
+            ;;
+        http://* | https://*)
+            curl -fsSL -o "${dest}" "${location%/}/${name}"
+            ;;
+        *)
+            cp "${location%/}/${name}" "${dest}"
+            ;;
+    esac
+}
+
+# Prints the path of the rvllm binary, downloading and verifying it if needed.
+resolve_binary() {
+    if [ -n "${RVLLM_BINARY:-}" ]; then
+        [ -x "${RVLLM_BINARY}" ] || die "RVLLM_BINARY=${RVLLM_BINARY} is not an executable file"
+        echo "${RVLLM_BINARY}"
+        return
+    fi
+    [ -n "${RVLLM_BINARY_URL:-}" ] ||
+        die "set RVLLM_BINARY to an rvllm binary, or RVLLM_BINARY_URL to where to download it from"
+    local tmp
+    tmp="$(mktemp -d)"
+    # shellcheck disable=SC2064 # expand ${tmp} now: it is local to this function
+    trap "rm -rf '${tmp}'" RETURN
+    local expected="${RVLLM_BINARY_SHA256:-}"
+    if [ -z "${expected}" ]; then
+        fetch "${RVLLM_BINARY_URL}" metadata.json "${tmp}/metadata.json" ||
+            die "could not fetch metadata.json from ${RVLLM_BINARY_URL} (or set RVLLM_BINARY_SHA256)"
+        expected="$("${PYTHON}" -c 'import json, sys; print(json.load(open(sys.argv[1]))["sha256"])' \
+            "${tmp}/metadata.json")" || die "metadata.json from ${RVLLM_BINARY_URL} has no sha256"
+    fi
+    local cached="${CACHE_DIR}/bin/${expected}/rvllm"
+    if [ -x "${cached}" ] && [ "$(sha256_of "${cached}")" = "${expected}" ]; then
+        echo "${cached}"
+        return
+    fi
+    fetch "${RVLLM_BINARY_URL}" rvllm "${tmp}/rvllm" ||
+        die "could not fetch the rvllm binary from ${RVLLM_BINARY_URL}"
+    local actual
+    actual="$(sha256_of "${tmp}/rvllm")"
+    [ "${actual}" = "${expected}" ] ||
+        die "rvllm from ${RVLLM_BINARY_URL} has sha256 ${actual}, expected ${expected}"
+    mkdir -p "$(dirname "${cached}")"
+    chmod 755 "${tmp}/rvllm"
+    mv -f "${tmp}/rvllm" "${cached}"
+    echo "${cached}"
+}
+
+# Prints the directory of the installed exporter package.
+exporter_dir() {
+    "${PYTHON}" -c 'import os, vllm_torchtpu.experimental.export as e; print(os.path.dirname(e.__file__))'
+}
+
+serve() {
+    local binary="$1"
+    shift
+    local model="" export_args=() serve_args=()
+    # Whether the last argument was a model option still waiting for its value:
+    # the exporter's options are not known here, so a bare word after one of
+    # them is its value. The model comes first, as in `vllm serve <model>`.
+    local export_value_pending=0
+    while [ $# -gt 0 ]; do
+        local arg="$1" name="${1%%=*}"
+        if [[ "${arg}" != -* ]]; then
+            if [ "${export_value_pending}" -eq 1 ]; then
+                export_args+=("${arg}")
+            elif [ -z "${model}" ]; then
+                model="${arg}"
+            else
+                die "unexpected argument '${arg}' (the model is '${model}')"
+            fi
+            export_value_pending=0
+            shift
+            continue
+        fi
+        export_value_pending=0
+        if [ "${name}" = "--model" ]; then
+            if [[ "${arg}" == *=* ]]; then
+                model="${arg#*=}"
+            else
+                [ $# -ge 2 ] || die "--model needs a value"
+                model="$2"
+                shift
+            fi
+        elif is_one_of "${name}" "${SERVE_BOOL_FLAGS[@]}"; then
+            serve_args+=("${arg}")
+        elif is_one_of "${name}" "${SERVE_VALUE_FLAGS[@]}" "${SHARED_VALUE_FLAGS[@]}"; then
+            local pair=("${arg}")
+            if [[ "${arg}" != *=* ]]; then
+                [ $# -ge 2 ] || die "${arg} needs a value"
+                pair+=("$2")
+                shift
+            fi
+            serve_args+=("${pair[@]}")
+            if is_one_of "${name}" "${SHARED_VALUE_FLAGS[@]}"; then
+                export_args+=("${pair[@]}")
+            fi
+        elif [ "${name}" = "--output-dir" ] || [ "${name}" = "--export-mode" ]; then
+            die "${name} is chosen by rvllm.bin; set RVLLM_ARTIFACT_DIR to serve an existing artifact"
+        else
+            # A model argument: the exporter takes the `vllm serve` command line
+            # and records in the artifact what the runtime needs.
+            export_args+=("${arg}")
+            [[ "${arg}" == *=* ]] || export_value_pending=1
+        fi
+        shift
+    done
+
+    local artifact="${RVLLM_ARTIFACT_DIR:-}"
+    if [ -z "${artifact}" ]; then
+        [ -n "${model}" ] || die "usage: rvllm.bin serve <model> [vllm serve arguments]"
+        local source_hash key
+        source_hash="$(cd "$(exporter_dir)" && find . -name '*.py' -print0 | sort -z |
+            xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+        key="$(printf '%s\0' "${model}" "${export_args[@]}" "${source_hash}" | sha256sum | cut -c1-24)"
+        artifact="${CACHE_DIR}/artifacts/${key}"
+        if [ ! -f "${artifact}/.complete" ]; then
+            echo "rvllm.bin: exporting ${model} to ${artifact}" >&2
+            rm -rf "${artifact}.partial"
+            mkdir -p "$(dirname "${artifact}")"
+            "${PYTHON}" -m vllm_torchtpu.experimental.export "${model}" \
+                --output-dir "${artifact}.partial" --export-mode all "${export_args[@]}"
+            rm -rf "${artifact}"
+            mv "${artifact}.partial" "${artifact}"
+            touch "${artifact}/.complete"
+        else
+            echo "rvllm.bin: serving the cached export ${artifact}" >&2
+        fi
+    fi
+    exec "${binary}" serve "${artifact}" "${serve_args[@]}"
+}
+
+main() {
+    case "${1:-}" in
+        "" | -h | --help)
+            sed -n '/^# Serves a model/,/^# *PYTHON /p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            return
+            ;;
+    esac
+    # A failed command substitution stops the script only in an assignment.
+    local binary
+    binary="$(resolve_binary)"
+    case "$1" in
+        serve)
+            shift
+            if [[ " $* " == *" --help "* ]] || [[ " $* " == *" -h "* ]]; then
+                exec "${binary}" serve --help
+            fi
+            serve "${binary}" "$@"
+            ;;
+        *)
+            exec "${binary}" "$@"
+            ;;
+    esac
+}
+
+main "$@"
