@@ -21,30 +21,61 @@ import pytest
 from vllm_torchtpu.omni.omni_tpu_model_runner import OmniTPUModelRunner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
+from .mock_omni import _MockOmniConnectorModelRunnerMixin
+
 pytestmark = pytest.mark.cpu_test
 
 
 def _make_bare_runner(cls=OmniTPUModelRunner):
     """Instantiate a runner class without invoking TPUModelRunner.__init__."""
     runner = cls.__new__(cls)
-    runner._omni_connector_initialized = False
+    runner.init_omni_connectors = MagicMock()
     return runner
 
 
 def test_omni_tpu_model_runner_inheritance():
+    # The connector mixin lives on the shared base so every Omni runner (AR
+    # now, generation next) gets one connector lifecycle.
     assert issubclass(OmniTPUModelRunner, TPUModelRunner)
+    assert issubclass(OmniTPUModelRunner, _MockOmniConnectorModelRunnerMixin)
+    assert OmniTPUModelRunner._omni_connector_initialized is False
 
 
-def test_omni_tpu_model_runner_load_model():
+@pytest.mark.parametrize(
+    "model_config",
+    [
+        SimpleNamespace(requires_full_payload_input=True),
+        SimpleNamespace(custom_process_next_stage_input_func="pkg.mod.func"),
+        SimpleNamespace(stage_connector_role="sender"),
+    ],
+)
+def test_omni_tpu_model_runner_load_model_inits_connectors_when_needed(model_config):
     runner = _make_bare_runner()
-    runner.model_config = MagicMock()
-    runner.init_omni_connectors = MagicMock()
+    runner.model_config = model_config
 
     with patch.object(TPUModelRunner, "load_model") as mock_super_load:
         runner.load_model()
         mock_super_load.assert_called_once_with()
 
-    runner.init_omni_connectors.assert_called_once_with(runner.model_config)
+    runner.init_omni_connectors.assert_called_once_with(model_config)
+
+
+def test_omni_tpu_model_runner_load_model_skips_connectors_when_not_needed():
+    runner = _make_bare_runner()
+    # A stage that neither consumes a full payload, produces inter-stage data,
+    # nor has an explicit connector role must not start connector threads.
+    runner.model_config = SimpleNamespace(
+        requires_full_payload_input=False,
+        custom_process_next_stage_input_func=None,
+        stage_connector_role=None,
+    )
+
+    with patch.object(TPUModelRunner, "load_model") as mock_super_load:
+        runner.load_model()
+        mock_super_load.assert_called_once_with()
+
+    runner.init_omni_connectors.assert_not_called()
+    assert runner._omni_connector_initialized is False
 
 
 def test_omni_tpu_model_runner_update_states():
@@ -58,3 +89,14 @@ def test_omni_tpu_model_runner_update_states():
 
     assert res == "updated"
     runner.cleanup_finished_request.assert_called_once_with("req-1")
+
+
+def test_omni_tpu_model_runner_update_states_without_connectors():
+    runner = _make_bare_runner()
+    runner.cleanup_finished_request = MagicMock()
+    sched_out = SimpleNamespace(finished_req_ids=["req-1"])
+
+    with patch.object(TPUModelRunner, "_update_states", return_value="updated"):
+        assert runner._update_states(sched_out) == "updated"
+
+    runner.cleanup_finished_request.assert_not_called()

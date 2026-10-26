@@ -106,6 +106,16 @@ class _MockOmniConnectorModelRunnerMixin:
         return ("connector_attached", output)
 
 
+def _mock_needs_omni_connector(model_config):
+    """Same predicate as upstream ``needs_omni_connector`` (full-payload
+    consumer, inter-stage producer, or explicit connector role)."""
+    return bool(
+        getattr(model_config, "requires_full_payload_input", False)
+        or getattr(model_config, "custom_process_next_stage_input_func", None)
+        or getattr(model_config, "stage_connector_role", None) is not None
+    )
+
+
 class _MockQwen3OmniMoeAudioEncoder:
     def __init__(self):
         self.conv2d1 = MagicMock()
@@ -128,12 +138,11 @@ vllm_omni_mock.diffusion.attention.backends.registry.register_diffusion_backend 
 )
 vllm_omni_mock.diffusion.models.ltx2.ltx2_runtime.LTXRuntime = _MockLTXRuntime
 vllm_omni_mock.worker.mixins.OmniWorkerMixin = _MockOmniWorkerMixin
-vllm_omni_mock.worker.omni_connector_model_runner_mixin.OmniConnectorModelRunnerMixin = (
-    _MockOmniConnectorModelRunnerMixin
-)
-vllm_omni_mock.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3OmniMoeAudioEncoder = (
-    _MockQwen3OmniMoeAudioEncoder
-)
+_connector_mixin_mod = vllm_omni_mock.worker.omni_connector_model_runner_mixin
+_connector_mixin_mod.OmniConnectorModelRunnerMixin = _MockOmniConnectorModelRunnerMixin
+_connector_mixin_mod.needs_omni_connector = _mock_needs_omni_connector
+_thinker_mod = vllm_omni_mock.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker
+_thinker_mod.Qwen3OmniMoeAudioEncoder = _MockQwen3OmniMoeAudioEncoder
 
 sys.modules["vllm_omni"] = vllm_omni_mock
 sys.modules["vllm_omni.platforms"] = vllm_omni_mock.platforms
@@ -160,14 +169,12 @@ sys.modules["vllm_omni.diffusion.models.ltx2.ltx2_runtime"] = (
 )
 sys.modules["vllm_omni.worker"] = vllm_omni_mock.worker
 sys.modules["vllm_omni.worker.mixins"] = vllm_omni_mock.worker.mixins
-sys.modules["vllm_omni.worker.omni_connector_model_runner_mixin"] = (
-    vllm_omni_mock.worker.omni_connector_model_runner_mixin
-)
+sys.modules["vllm_omni.worker.omni_connector_model_runner_mixin"] = _connector_mixin_mod
 sys.modules["vllm_omni.model_executor"] = vllm_omni_mock.model_executor
 sys.modules["vllm_omni.model_executor.models"] = vllm_omni_mock.model_executor.models
 sys.modules["vllm_omni.model_executor.models.qwen3_omni"] = (
     vllm_omni_mock.model_executor.models.qwen3_omni
 )
-sys.modules[
-    "vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker"
-] = vllm_omni_mock.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker
+sys.modules["vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker"] = (
+    _thinker_mod
+)

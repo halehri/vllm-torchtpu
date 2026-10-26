@@ -594,6 +594,44 @@ class TestTpuPlatform:
 
         assert vllm_config.scheduler_config.disable_chunked_mm_input is False
 
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_resolves_auto_worker_cls(
+        self, mock_prepare_env, mock_apply_patches, vllm_config
+    ):
+        vllm_config.cache_config.block_size = 16
+        vllm_config.parallel_config.worker_cls = "auto"
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        assert (
+            vllm_config.parallel_config.worker_cls
+            == "vllm_torchtpu.worker.tpu_worker.TPUWorker"
+        )
+
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_keeps_explicit_worker_cls(
+        self, mock_prepare_env, mock_apply_patches, vllm_config
+    ):
+        # vllm-omni resolves each stage's worker (e.g. the Omni AR worker)
+        # before this hook runs; the hook must not clobber that choice.
+        vllm_config.cache_config.block_size = 16
+        vllm_config.parallel_config.worker_cls = (
+            "vllm_torchtpu.omni.tpu_ar_worker.TPUARWorker"
+        )
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        assert (
+            vllm_config.parallel_config.worker_cls
+            == "vllm_torchtpu.omni.tpu_ar_worker.TPUARWorker"
+        )
+
     def test_get_tpu_multihost_topology(self, monkeypatch):
         # Test env override via TORCH_TPU_TOPOLOGY
         monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "4,4,1")
