@@ -320,3 +320,30 @@ def test_gap_cli_rejects_conflicting_plan_flags(tmp_path: Path) -> None:
         ]
     )
     assert rc == 2
+
+
+def test_plan_from_serve_args_kv_dtype_absent_is_model_dtype() -> None:
+    par, dt = rf.plan_from_serve_args(["--tensor-parallel-size=8"], {})
+    assert par == Parallel(tp=8)
+    assert dt.kv == 2.0
+
+
+def test_gap_reports_fixed_cost_rows() -> None:
+    sf = step_floor(
+        QWEN35_GEOM,
+        CHIPS["tpu7x"],
+        Parallel(tp=8),
+        StepShape(batch=1, rows_per_seq=1, context=1024),
+    )
+    base = compare_measured(sf, CHIPS["tpu7x"], {"moe": 0.500, "step_ms": 6.000})
+    rep = compare_measured(
+        sf,
+        CHIPS["tpu7x"],
+        {"moe": 0.500, "scale_relayout": 1.90, "logits_ag": 1.28, "step_ms": 6.000},
+    )
+    rows = {m.name: m for m in rep.modules}
+    for name, ms in (("scale_relayout", 1.90), ("logits_ag", 1.28)):
+        assert rows[name].floor_ms == 0.0
+        assert rows[name].measured_ms == pytest.approx(ms)
+    assert rep.unmapped_keys == ()
+    assert base.unattributed_ms - rep.unattributed_ms == pytest.approx(1.90 + 1.28)

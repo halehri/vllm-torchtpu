@@ -46,7 +46,13 @@ _NAME_ALIASES: dict[str, str] = {
     "reduce-scatter": "collectives",
     "Step time": "step_ms",
     "step_time_ms": "step_ms",
+    "as_strided": "scale_relayout",
+    "scale_relayout": "scale_relayout",
+    "logits_ag": "logits_ag",
+    "sampling": "sampling",
+    "host_gap": "host_gap",
 }
+_FIXED_ROWS = ("scale_relayout", "logits_ag", "sampling", "host_gap")
 
 
 @dataclass(frozen=True)
@@ -159,7 +165,7 @@ def compare_measured(
             and m.bf16_flops == 0.0
         )
     ]
-    known_names = {m.name for m in comp_mods} | {"collectives"}
+    known_names = {m.name for m in comp_mods} | {"collectives"} | set(_FIXED_ROWS)
     unmapped_keys = _extract_unmapped_keys(measured, known_names)
 
     for m in comp_mods:
@@ -202,6 +208,14 @@ def compare_measured(
             coll_meas_ms,
         )
     )
+    for name in _FIXED_ROWS:  # measured per-step costs with no analytic floor
+        if name not in mod_map:
+            continue
+        meas_ms = mod_map[name]
+        sum_measured_mods += meas_ms
+        if meas_ms > 0.0:
+            positive_gap_sum += meas_ms
+        raw_rows.append((name, 0.0, 0.0, 0.0, 0.0, 0.0, meas_ms))
 
     measured_step_ms = (
         explicit_step_ms if explicit_step_ms is not None else sum_measured_mods

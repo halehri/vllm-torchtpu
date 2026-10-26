@@ -40,7 +40,7 @@ def plan_from_serve_args(
     tp = 1
     moe: Literal["tp_slice", "ep"] = "tp_slice"
     kv_split = 1
-    kv_bytes = 1.0
+    kv_bytes = _KV_CACHE_DTYPE_BYTES["auto"]  # vLLM default: KV in the model dtype
 
     tokens = list(argv)
     i = 0
