@@ -136,6 +136,24 @@ _SAVE_RETRIES = envs.VLLM_TPU_OFFLOAD_SAVE_RETRIES
 # sockets cannot claim the port or trigger TCP loopback self-connects while
 # workers poll before KVCacheStore binds.
 _DEFAULT_CONTROLLER_PORT = 27800
+_IP_LOCAL_PORT_RANGE_PATH = "/proc/sys/net/ipv4/ip_local_port_range"
+_DEFAULT_EPHEMERAL_PORT_RANGE = (32768, 60999)
+
+
+def _get_ephemeral_port_range(
+    path: str = _IP_LOCAL_PORT_RANGE_PATH,
+) -> tuple[int, int]:
+    """Read the host kernel's ephemeral port range (low, high) from procfs."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            low_str, high_str = f.read().split()[:2]
+        low, high = int(low_str), int(high_str)
+        if 0 < low <= high <= 65535:
+            return low, high
+    except (OSError, ValueError):
+        pass
+    return _DEFAULT_EPHEMERAL_PORT_RANGE
+
 
 # Host bytes behind one offloaded block, summed over every worker rank, as
 # recorded from the per-worker KV cache configs before the offloading spec is
@@ -2369,9 +2387,29 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         dp_rank_local = vllm_config.parallel_config.data_parallel_rank_local
         if dp_rank_local is None:
             dp_rank_local = dp_rank
-        self.raiden_controller_port = dp_rank_local + int(
+        base_controller_port = int(
             self.extra_config.get("raiden_controller_port", _DEFAULT_CONTROLLER_PORT)
         )
+        self.raiden_controller_port = dp_rank_local + base_controller_port
+        if isinstance(self.raiden_controller_port, int):
+            ephemeral_low, ephemeral_high = _get_ephemeral_port_range()
+            if ephemeral_low <= self.raiden_controller_port <= ephemeral_high:
+                logger.warning(
+                    "TPURaidenOffloadingConnector: raiden_controller_port %d "
+                    "(base=%d + dp_rank_local=%d) falls inside the host "
+                    "ephemeral port range %d..%d (%s); a client socket on this "
+                    "host may claim the port before KVCacheStore binds it. Set "
+                    "'raiden_controller_port' in kv_connector_extra_config "
+                    "outside ip_local_port_range (for example, < %d such as %d).",
+                    self.raiden_controller_port,
+                    base_controller_port,
+                    dp_rank_local,
+                    ephemeral_low,
+                    ephemeral_high,
+                    _IP_LOCAL_PORT_RANGE_PATH,
+                    ephemeral_low,
+                    _DEFAULT_CONTROLLER_PORT,
+                )
         self.raiden_job_name = str(
             self.extra_config.get("raiden_job_name", f"vllm-offload-{config.engine_id}")
         )
