@@ -21,12 +21,11 @@ def test_union_stats_counts_tiles_and_groups():
         sel[i, : k - 4] = rng.choice(40000, k - 4, replace=False)  # ctx bucket <64K
     stats = np.asarray(union_stats_step(jnp.asarray(sel), jnp.zeros(STATS, jnp.int32)))
     blocks = sel[:1024].reshape(2, -1)
-    tiles = sum(len(np.unique(b[b >= 0] // 1024)) for b in blocks)
-    groups = sum(len(np.unique(b[b >= 0] // 4)) for b in blocks)
     bucket = 2  # 32K <= max < 64K
     assert stats[bucket] == 2
-    assert stats[BUCKETS + bucket] == tiles
-    assert stats[2 * BUCKETS + bucket] == groups
+    for u, unit in enumerate((1024, 256, 128, 4)):
+        want = sum(len(np.unique(b[b >= 0] // unit)) for b in blocks)
+        assert stats[(1 + u) * BUCKETS + bucket] == want
     assert "ctx<64K" in format_stats(stats)
 
 
