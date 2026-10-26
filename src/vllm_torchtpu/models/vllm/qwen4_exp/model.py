@@ -13,7 +13,6 @@
 # limitations under the License.
 """Checkpoint-native text backbone with explicit TPU state/input ownership."""
 
-import os
 from collections.abc import Iterable, Sequence
 from functools import partial
 from pathlib import Path
@@ -155,11 +154,6 @@ def ple_speculative_state(metadata):
     rows = torch.arange(ckpt.shape[0], device=ckpt.device)
     windowed = rows < distribution[0].to(rows.dtype)
     return read_ids, ckpt, windowed
-
-
-LOGITS_CLONE = os.environ.get("QWEN4_EXP_LOGITS_CLONE", "1").strip().lower() not in (
-    "0", "false", "off", "no"
-)
 
 
 def hc_config(config):
@@ -905,14 +899,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
     plain_compute_logits = True
 
     def compute_logits(self, hidden_states):
-        # The vocab all-gather ends in a reshape of the gathered [rows, tp, v/tp]
-        # buffer, so a compiled caller's logits output is a view of a graph
-        # intermediate, which torch-tpu rebuilds after every call in a separate
-        # relayout program (`tt_jit_export_..._as_strided`, ~0.16 ms/step at c8).
-        # The clone makes the relayout part of the compiled program instead.
-        # QWEN4_EXP_LOGITS_CLONE=0 keeps the view (same-image A/B control).
-        logits = self.logits_processor(self.lm_head, hidden_states)
-        return logits.clone() if LOGITS_CLONE else logits
+        return self.logits_processor(self.lm_head, hidden_states)
 
     @classmethod
     def get_mamba_state_dtype_from_config(cls, cfg):
