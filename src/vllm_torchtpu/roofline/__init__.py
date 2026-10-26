@@ -27,10 +27,18 @@ from .modules import (
     experts_touched,
     pass_costs,
 )
-from .serving import ConcurrencyRow, plan
+from .serving import (
+    BucketRegimePlan,
+    BucketRegimeRow,
+    ConcurrencyRow,
+    plan,
+    recommend_bucket_regimes,
+)
 from .step import StepFloor, spec_cycle_floor, step_floor
 
 __all__ = [
+    "BucketRegimePlan",
+    "BucketRegimeRow",
     "CHIPS",
     "ChipSpec",
     "Collective",
@@ -46,6 +54,7 @@ __all__ = [
     "from_hf_config",
     "pass_costs",
     "plan",
+    "recommend_bucket_regimes",
     "spec_cycle_floor",
     "step_floor",
 ]

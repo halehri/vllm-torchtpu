@@ -85,6 +85,7 @@ _SMEM_OVERHEAD_BYTES = 236 * 1024
 # stride from the operands when they are not given, so nothing here has to vary
 # with the token count -- which is what keeps the token count out of the traced
 # graph.
+_DEFAULT_FUSED_EP_STEP_MIN_NODE_TOKENS = 128
 FUSED_MOE_EP_OP_NAME = "pallas::fused_moe_ep"
 
 # Ops are built at weight-load time and the compiled forward may only look them
@@ -141,6 +142,140 @@ def _squeeze_channel_scale(
     return s.contiguous()
 
 
+def _gmm_ep_fallback(
+    x: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array,
+    w2_scale: jax.Array,
+    gating: jax.Array,
+    rank: jax.Array,
+    *,
+    mesh: jax.sharding.Mesh,
+    topk: int,
+    renormalize: bool,
+    activation: str,
+    scoring_fn: str,
+    routed_scaling_factor: float,
+    mesh_expert_order: tuple[int, ...] | None,
+    token_replica_groups: tuple[tuple[int, ...], ...] | None,
+    use_sparse_core: bool,
+    onehot_threshold: int,
+    score_bias: jax.Array | None = None,
+) -> jax.Array:
+    """Run gmm_v2 inside the EP_AXIS_NAME shard_map for small decode buckets."""
+    from vllm_torchtpu.kernels.fused_moe.v2.layer import (
+        _apply_scoring_fn,
+        _row_routes,
+    )
+    from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import (
+        TokenReplicaLayout,
+    )
+    from vllm_torchtpu.layers.core.fused_moe_gmm import fused_moe_func
+
+    ep = int(mesh.shape[EP_AXIS_NAME])
+    input_rows = x.shape[0] // ep
+    e_total = gating.shape[-1]
+    token_layout = TokenReplicaLayout.create(
+        ep=ep,
+        input_rows=input_rows,
+        groups=token_replica_groups,
+        row_alignment=1,
+    )
+    single_replica_group = len(token_layout.groups) == 1
+    in_specs = (
+        PartitionSpec(EP_AXIS_NAME),
+        PartitionSpec(EP_AXIS_NAME),
+        PartitionSpec(EP_AXIS_NAME),
+        PartitionSpec(EP_AXIS_NAME),
+        PartitionSpec(EP_AXIS_NAME),
+        PartitionSpec(EP_AXIS_NAME),
+        PartitionSpec(EP_AXIS_NAME),
+    ) + ((PartitionSpec(),) if score_bias is not None else ())
+
+    def _per_shard(x_s, rank_s, w1_s, w2_s, s1_s, s2_s, g_s, *bias_arg):
+        me = rank_s.reshape(())
+        if single_replica_group:
+            x_all, g_all = x_s, g_s
+        else:
+            x_dedup = token_layout.split(x_s, me, fill_value=0)
+            g_dedup = token_layout.split(g_s, me, fill_value=-jnp.inf)
+            x_all = jax.lax.all_gather(x_dedup, EP_AXIS_NAME, axis=0, tiled=True)
+            g_all = jax.lax.all_gather(g_dedup, EP_AXIS_NAME, axis=0, tiled=True)
+        scores = _apply_scoring_fn(g_all, scoring_fn)
+        row_routes = _row_routes(scores, g_all)
+        scores_clean = jnp.where(row_routes, scores, 0.0)
+        bias_s = bias_arg[0] if bias_arg else None
+        if bias_s is None:
+            topk_weights, topk_ids = jax.lax.top_k(scores_clean, topk)
+        else:
+            _, topk_ids = jax.lax.top_k(
+                scores_clean + bias_s.astype(jnp.float32)[None, :], topk
+            )
+            topk_weights = jnp.take_along_axis(scores_clean, topk_ids, axis=-1)
+        if renormalize:
+            denom = jnp.maximum(jnp.sum(topk_weights, axis=-1, keepdims=True), 1e-20)
+            topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
+        if routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * jnp.float32(routed_scaling_factor)
+        topk_weights = jnp.where(row_routes, topk_weights, 0.0).astype(x_all.dtype)
+        topk_ids = jnp.where(row_routes, topk_ids.astype(jnp.int32), jnp.int32(e_total))
+        x_clean = jnp.where(row_routes, x_all, 0)
+        ep_rank = (
+            jnp.asarray(mesh_expert_order, dtype=jnp.int32)[me]
+            if mesh_expert_order is not None
+            else me
+        )
+        e_local = w1_s.shape[0]
+        experts_start = ep_rank * jnp.int32(e_local)
+        s1_4d = (
+            s1_s[:, None, None, :]
+            if s1_s.ndim == 2
+            else s1_s.reshape(e_local, 1, -1, s1_s.shape[-1])
+        )
+        s2_4d = (
+            s2_s[:, None, None, :]
+            if s2_s.ndim == 2
+            else s2_s.reshape(e_local, 1, -1, s2_s.shape[-1])
+        )
+        partial = fused_moe_func(
+            x_clean,
+            w1_s,
+            w2_s,
+            s1_4d,
+            s2_4d,
+            None,
+            None,
+            topk_weights,
+            topk_ids,
+            experts_start,
+            topk=topk,
+            activation=activation,
+            use_ep=True,
+            use_sparse_core=use_sparse_core,
+            onehot_moe_permute_threshold=onehot_threshold,
+            rhs_quant_dtype=None,
+            skip_padded_tokens=True,
+        )
+        if single_replica_group:
+            return jax.lax.psum(partial, EP_AXIS_NAME)
+        reduced = jax.lax.psum_scatter(
+            partial, EP_AXIS_NAME, scatter_dimension=0, tiled=True
+        )
+        return token_layout.restore(reduced, EP_AXIS_NAME)
+
+    operands = (x, rank, w1, w2, w1_scale, w2_scale, gating) + (
+        (score_bias,) if score_bias is not None else ()
+    )
+    return jax.shard_map(
+        _per_shard,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=PartitionSpec(EP_AXIS_NAME),
+        check_vma=False,
+    )(*operands)
+
+
 def fused_moe_ep_supported(owner: Any) -> bool:
     """Whether `prebuild_fused_moe_ep` armed the fused path for this layer.
 
@@ -181,6 +316,7 @@ def _build_op(
     *,
     token_replica_groups=None,
     sorted_gather=None,
+    min_node_tokens: int = 0,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -188,6 +324,9 @@ def _build_op(
     None for the single fused program. With it the op is a `_SortedGatherOp`.
     """
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
+    from vllm_torchtpu.layers.core.fused_moe_gmm import (
+        resolve_onehot_permute_threshold,
+    )
 
     key = (
         topk,
@@ -203,6 +342,7 @@ def _build_op(
         has_hash_ids,
         token_replica_groups,
         None if sorted_gather is None else sorted_gather[1],
+        min_node_tokens,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -216,10 +356,41 @@ def _build_op(
     routing_kw = dict(
         scoring_fn=scoring_fn, routed_scaling_factor=routed_scaling_factor
     )
+    use_sparse_core = envs.USE_MOE_SPARSE_CORE
+    onehot_threshold = resolve_onehot_permute_threshold()
 
     # Any: the layer, route or compute result depending on bias_kw's stage;
     # each wrapper below declares the one it returns.
     def call(x, w1, w2, w1_scale, w2_scale, gating, rank, **bias_kw) -> Any:
+        node_tokens = x.shape[0]
+        if (
+            min_node_tokens > 0
+            and node_tokens < min_node_tokens
+            and sorted_gather is None
+            and weight_format == "fp8"
+            and "hash_topk_ids" not in bias_kw
+            and "stage" not in bias_kw
+        ):
+            return _gmm_ep_fallback(
+                x,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                gating.astype(jnp.float32),
+                rank,
+                mesh=mesh,
+                topk=topk,
+                renormalize=renormalize,
+                activation=activation,
+                scoring_fn=scoring_fn,
+                routed_scaling_factor=routed_scaling_factor,
+                mesh_expert_order=mesh_expert_order,
+                token_replica_groups=token_replica_groups,
+                use_sparse_core=use_sparse_core,
+                onehot_threshold=onehot_threshold,
+                score_bias=bias_kw.get("score_bias"),
+            )
         # The router's top-k selector writes into an f32 accumulator ref, so a
         # bf16 gate output -- which is what the model's gate matmul produces --
         # fails inside the kernel on a dtype mismatch. Widen at the boundary;
@@ -946,6 +1117,14 @@ def prebuild_fused_moe_ep(
         has_hash_ids,
         token_replica_groups=token_replica_groups,
         sorted_gather=sorted_gather,
+        min_node_tokens=(
+            min(
+                int(envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS),
+                _DEFAULT_FUSED_EP_STEP_MIN_NODE_TOKENS,
+            )
+            if int(envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS) > 0
+            else 0
+        ),
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "

@@ -24,7 +24,7 @@ from pathlib import Path
 from .chips import CHIPS
 from .geometry import from_hf_config
 from .modules import Dtypes, Parallel, StepShape
-from .serving import plan
+from .serving import plan, recommend_bucket_regimes
 from .step import spec_cycle_floor, step_floor
 
 _WEIGHT_BYTES: dict[str, float] = {"bf16": 2.0, "fp8": 1.0}
@@ -68,7 +68,7 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the roofline plan or explain subcommand."""
+    """Run the roofline plan, explain, or buckets subcommand."""
     parser = argparse.ArgumentParser(prog="python -m vllm_torchtpu.roofline")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -83,6 +83,13 @@ def main(argv: list[str] | None = None) -> int:
     p_exp.add_argument("--batch", type=int, default=1)
     p_exp.add_argument("--rows-per-seq", type=int, default=1)
     p_exp.add_argument("--spec-window", type=int, default=0)
+
+    p_bkt = sub.add_parser("buckets")
+    _add_common_args(p_bkt)
+    p_bkt.add_argument(
+        "--compile-sizes",
+        default="4,8,16,32,48,64,128,256,512,1024,2048,4096,8192,16384",
+    )
 
     args = parser.parse_args(argv)
     if args.tp <= 0:
@@ -142,6 +149,29 @@ def main(argv: list[str] | None = None) -> int:
                 f"{r.output_tput_ceil_per_chip:>25.1f}  {r.flag:<7}\n"
             )
             sys.stdout.write(line)
+        return 0
+
+    if args.cmd == "buckets":
+        sizes = [int(x) for x in args.compile_sizes.split(",") if x.strip()]
+        bplan = recommend_bucket_regimes(
+            geom=geom,
+            chip=chip,
+            par=par,
+            dt=dt,
+            compile_sizes=sizes,
+            context=args.context,
+            collective_latency_us=args.collective_latency_us,
+        )
+        if args.json:
+            sys.stdout.write(json.dumps(asdict(bplan)) + "\n")
+            return 0
+        for r in bplan.buckets:
+            sys.stdout.write(
+                f"{r.tokens:>6}  {r.node_tokens:>8}  {r.residual:<10}  "
+                f"{r.moe_dispatch:<10}  {r.binding:<7}  "
+                f"{r.hard_floor_ms:>10.3f}  {r.serial_floor_ms:>12.3f}  "
+                f"{r.flag:<7}\n"
+            )
         return 0
 
     if args.spec_window > 0:
