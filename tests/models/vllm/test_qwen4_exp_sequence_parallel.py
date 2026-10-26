@@ -180,6 +180,23 @@ class SplitMoE(nn.Module):
         return self.tp.total(self._shared_partial(block)) + self.routed(block, logits)
 
 
+class ReplicatedSplitMoE(SplitMoE):
+    """SplitMoE with the whole shared expert on every rank
+    (QWEN4_EXP_SP_REPLICATED_SHARED_EXPERT)."""
+
+    def __init__(self, tp, weight):
+        super().__init__(tp, weight)
+        self.replicate_shared_expert = True
+        self.shared_expert = self._shared_full
+
+    def _shared_full(self, block):
+        return torch.sin(block.float() @ self.weight).to(block.dtype)
+
+    def forward(self, block):
+        logits, _ = self.gate(block)
+        return self._shared_full(block) + self.routed(block, logits)
+
+
 def make_layer(tp, layer_type, attn_hc, mlp_hc, attn_weight, moe_weight):
     from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpDecoderLayer
 
@@ -199,7 +216,7 @@ def make_layer(tp, layer_type, attn_hc, mlp_hc, attn_weight, moe_weight):
 
 
 @pytest.mark.parametrize("sp_pad", [0, 24])
-@pytest.mark.parametrize("split_moe", [False, True])
+@pytest.mark.parametrize("split_moe", [False, True, "replicated_shared"])
 @pytest.mark.parametrize("layer_type", ["linear_attention", "full_attention"])
 def test_decoder_layer_sequence_parallel_matches_tp(
     tp2, monkeypatch, layer_type, split_moe, sp_pad
@@ -208,7 +225,15 @@ def test_decoder_layer_sequence_parallel_matches_tp(
         vllm_adapter as adaptive_moe,
     )
 
-    monkeypatch.setattr(sp.envs, "QWEN4_EXP_PREFILL_SP_MOE", split_moe, raising=False)
+    monkeypatch.setattr(
+        sp.envs, "QWEN4_EXP_PREFILL_SP_MOE", bool(split_moe), raising=False
+    )
+    monkeypatch.setattr(
+        sp.envs,
+        "QWEN4_EXP_SP_REPLICATED_SHARED_EXPERT",
+        split_moe == "replicated_shared",
+        raising=False,
+    )
     calls = []
 
     def fake_adaptive(method, block, w1, w2, s1, s2, logits, attr):
@@ -229,7 +254,8 @@ def test_decoder_layer_sequence_parallel_matches_tp(
 
     def run(rank, sequence_parallel):
         layer = make_layer(tp2, layer_type, attn_hc, mlp_hc, attn_w, moe_w)
-        layer.mlp = SplitMoE(tp2, moe_w)
+        moe = ReplicatedSplitMoE if split_moe == "replicated_shared" else SplitMoE
+        layer.mlp = moe(tp2, moe_w)
         layers[rank] = layer
         x = tp2.shard(hidden) if sequence_parallel else hidden
         pad = sp_pad if sequence_parallel else 0

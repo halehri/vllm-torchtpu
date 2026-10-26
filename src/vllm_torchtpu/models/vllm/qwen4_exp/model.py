@@ -245,7 +245,25 @@ class Qwen4ExpDecoderLayer(nn.Module):
             cfg.compilation_config.static_forward_context[prefix + ".self_attn"] = (
                 self.self_attn
             )
-        self.mlp = Qwen3NextSparseMoeBlock(vllm_config=cfg, prefix=prefix + ".mlp")
+        if envs.QWEN4_EXP_SP_REPLICATED_SHARED_EXPERT and sp.enabled(tp.world_size):
+            # Full shared-expert weights on every rank (as upstream does for a
+            # misaligned TP split): the sequence-parallel MoE then runs the
+            # shared expert on this rank's rows, with no all-gather or
+            # reduce-scatter of its input and output.
+            from vllm.model_executor.models import qwen3_next
+
+            original = qwen3_next._should_replicate_misaligned_shared_expert
+            qwen3_next._should_replicate_misaligned_shared_expert = (
+                lambda *args, **kwargs: True
+            )
+            try:
+                self.mlp = Qwen3NextSparseMoeBlock(
+                    vllm_config=cfg, prefix=prefix + ".mlp"
+                )
+            finally:
+                qwen3_next._should_replicate_misaligned_shared_expert = original
+        else:
+            self.mlp = Qwen3NextSparseMoeBlock(vllm_config=cfg, prefix=prefix + ".mlp")
         hc_up_tile = int(
             cfg.additional_config.get("qwen4_exp", {}).get("hc_prefill_up_tile", 0)
         )
@@ -393,18 +411,22 @@ class Qwen4ExpDecoderLayer(nn.Module):
         With a token-sharded adaptive EP op (QWEN4_EXP_PREFILL_SP_MOE=1) the
         routed experts take this rank's rows directly and the TP-sliced
         shared expert's partial sum is reduce-scattered: the same terms
-        MoERunner adds, (all-reduced shared) + (routed). Otherwise the block
+        MoERunner adds, (all-reduced shared) + (routed). A replicated shared
+        expert (QWEN4_EXP_SP_REPLICATED_SHARED_EXPERT) runs on this rank's
+        rows instead. Otherwise the block
         runs on the gathered rows (its EP kernel takes replicated rows and
         returns them reduced) and this rank keeps its rows.
         """
         mlp = self.mlp
         routed = getattr(getattr(mlp, "experts", None), "routed_experts", None)
         method = getattr(routed, "quant_method", None)
+        replicated = getattr(mlp, "replicate_shared_expert", None)
         if (
             not envs.QWEN4_EXP_PREFILL_SP_MOE
             or getattr(method, "_adaptive_fused_moe_op_sp", None) is None
             or getattr(mlp, "shared_expert", None) is None
-            or getattr(mlp, "replicate_shared_expert", True)
+            or replicated is None
+            or (replicated and not envs.QWEN4_EXP_SP_REPLICATED_SHARED_EXPERT)
         ):
             return sp.shard(mlp(sp.gather(block, num_tokens)))
         from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
@@ -425,6 +447,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
             router_logits,
             attr="_adaptive_fused_moe_op_sp",
         )
+        if replicated:
+            # QWEN4_EXP_SP_REPLICATED_SHARED_EXPERT: whole shared expert, own rows.
+            return mlp.shared_expert(block) + output
         shared = sp.reduce(mlp.shared_expert(sp.gather(block, num_tokens)), True)
         return shared + output
 
