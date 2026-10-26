@@ -153,17 +153,24 @@ def attend_row(
         to the last one; tokens past the row's length are masked below.
         """
         out = []
-        for j in range(TILE // MICRO):
-            v = pages[row, jnp.minimum(t * (TILE // MICRO) + j, ncols - 1)]
+        # Timing only (wrong data): "cK" issues TILE / (K * MICRO) copies of K
+        # micro-pages each (the bound for coalescing runs of K); "notable"
+        # skips the per-copy page-table load.
+        k_run = int(ablate[1:]) if ablate[:1] == "c" and ablate[1:].isdigit() else 1
+        for j in range(TILE // MICRO // k_run):
+            v = pages[row, jnp.minimum(t * (TILE // MICRO) + j * k_run, ncols - 1)]
             if table is not None:
-                v = (
-                    table[table_row_base + row // rows_per_req, v >> shift] * per_page
-                    + (v & (per_page - 1))
+                page = (
+                    table[table_row_base, 0]
+                    if ablate == "notable"
+                    else table[table_row_base + row // rows_per_req, v >> shift]
                 )
+                v = page * per_page + (v & (per_page - 1))
+            first = jnp.minimum(v & (per_page - 1), per_page - k_run)
             out.append(
                 pltpu.make_async_copy(
-                    pool.at[v >> shift, pl.ds((v & (per_page - 1)) * MICRO, MICRO)],
-                    ring.at[s, pl.ds(j * MICRO, MICRO)],
+                    pool.at[v >> shift, pl.ds(first * MICRO, MICRO * k_run)],
+                    ring.at[s, pl.ds(j * MICRO * k_run, MICRO * k_run)],
                     sems.at[s],
                 )
             )

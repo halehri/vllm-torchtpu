@@ -183,9 +183,9 @@ def _apply_removals(spec: str) -> None:
 
     arms = [x for x in spec.split(",") if x]
     for arm in arms:
-        if arm in ("attn_dma", "attn_matmul"):  # attend_row's own ablation switch
+        if arm.startswith("attn_"):  # attend_row's own ablation switch (one per run)
             qsa_full_c.attend_row = functools.partial(
-                qsa_full_c.attend_row, ablate=arm.split("_")[1]
+                qsa_full_c.attend_row, ablate=arm.split("_", 1)[1]
             )
         elif arm == "keys":  # no compressed-key stream or scoring
             qsa_full_b.QSAFullIndexedBlock._score_request = lambda self, *a, **k: None
