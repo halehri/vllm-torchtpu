@@ -825,8 +825,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # one Pallas call, with the attn combine fused ahead of the mlp mix.
     "TPU_QWEN4_HC_DECODE_FUSED": env_bool("TPU_QWEN4_HC_DECODE_FUSED"),
     # Debug: when > 0, every MoE layer counts its routed top-k expert ids in a
-    # device buffer, and the model logs the per-EP-rank load once, after this
-    # many forward calls (padded bucket rows are counted too).
+    # device buffer, and the model logs the per-EP-rank load of each window of
+    # this many forward calls (the first is dropped; padded rows count too).
     "VLLM_TPU_MOE_EXPERT_HIST": lambda: int(os.getenv("VLLM_TPU_MOE_EXPERT_HIST", "0")),
     # qwen4_exp: shard prefill-sized steps across TP ranks between attention
     # blocks (reduce-scatter instead of all-reduce), so the hyper-connection

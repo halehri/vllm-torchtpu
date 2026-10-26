@@ -894,11 +894,12 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             return self.model(input_ids, positions, inputs_embeds, **kwargs)
 
     def _expert_load_window(self):
-        """Debug only: zero the MoE expert histograms after N forward calls
-        (dropping warmup) and log the per-EP-rank load once after 2N."""
+        """Debug only: every N forward calls, log the per-EP-rank load of the
+        last N calls and zero the MoE expert histograms (the first window,
+        which holds warmup, is dropped unlogged)."""
         self._hist_calls = getattr(self, "_hist_calls", 0) + 1
         n = envs.VLLM_TPU_MOE_EXPERT_HIST
-        if self._hist_calls not in (n, 2 * n):
+        if self._hist_calls % n:
             return
         layers = [(name, m) for name, m in self.named_modules()
                   if getattr(m, "expert_hist", None) is not None]
@@ -918,9 +919,12 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             prev = merged.get(key)
             merged[key] = (hist if prev is None else [a + b for a, b in zip(prev[0], hist)],
                            m.moe_config.ep_size)
+        for _, m in layers:
+            m.expert_hist.zero_()
         if get_tensor_model_parallel_rank() != 0:
             return
-        print(f"moe expert load over forward calls {n}..{2 * n}", flush=True)
+        start = self._hist_calls - n
+        print(f"moe expert load over forward calls {start}..{self._hist_calls}", flush=True)
         for key, (hist, ep) in merged.items():
             print(format_expert_load(key, hist, max(ep, 1)), flush=True)
 
