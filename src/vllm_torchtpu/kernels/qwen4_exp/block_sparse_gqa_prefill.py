@@ -229,6 +229,9 @@ def _kernel(
     lean: bool = False,
 ):
     block = pl.program_id(0)
+    lean_key = lean or "leankey" in ablate
+    lean_causal = lean or "leancausal" in ablate
+    lean_bcast = lean or "leanbcast" in ablate
     # The model produces BF16 queries.  A BF16 call boundary can avoid a large
     # FP32 input window while preserving the existing FP32 QK accumulation.
     q = (
@@ -348,7 +351,7 @@ def _kernel(
         visible = pieces[0] if parts == 1 else jnp.concatenate(pieces, axis=0)
         if "nomask" in ablate:  # bench-only: no bitset expansion
             visible = jnp.ones((query_block, kv_tile), jnp.bool_)
-        if lean:
+        if lean_causal:
             # Only tiles reaching past the block's first query position need
             # the causal compare; every earlier tile is visible to all rows.
             visible = lax.cond(
@@ -373,7 +376,7 @@ def _kernel(
                     # A key only meets visible (written, finite) scores after
                     # the mask select below, so lean skips its guard. Values
                     # keep it: a masked probability is 0, and 0 x NaN is NaN.
-                    if not lean:
+                    if not lean_key:
                         key = jnp.where(jnp.isfinite(key) & written, key, 0)
                     value = jnp.where(jnp.isfinite(value) & written, value, 0)
             else:
@@ -412,7 +415,7 @@ def _kernel(
                     tile_visible[None, :, :],
                     (q_heads_per_kv, query_tile, kv_tile),
                 ).reshape(rows, kv_tile)
-                if lean:
+                if lean_bcast:
                     # Select per head on [heads, rows, cols] against the
                     # unbroadcast [rows, cols] mask.
                     score = jnp.where(

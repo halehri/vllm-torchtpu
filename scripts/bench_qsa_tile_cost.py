@@ -28,6 +28,9 @@ VARIANTS = {
     "noqk_nopv": {"QSA_PREFILL_ABLATE": "noqk,nopv"},
     "nodma": {"QSA_PREFILL_ABLATE": "nodma"},
     "bf16mxu": {"VLLM_TPU_QSA_PREFILL_BF16_MXU": "1"},
+    "leankey": {"QSA_PREFILL_ABLATE": "leankey"},
+    "leancausal": {"QSA_PREFILL_ABLATE": "leancausal"},
+    "leanbcast": {"QSA_PREFILL_ABLATE": "leanbcast"},
     "lean": {"VLLM_TPU_QSA_PREFILL_LEAN": "1"},
 }
 
@@ -54,7 +57,7 @@ print("TCOST " + json.dumps(dict(variant=sys.argv[1], ms24=a, ms160=c, tiles24=t
 
 
 def test_tile_cost_split():
-    only = os.environ.get("TCOST_VARIANTS", "base,lean")
+    only = os.environ.get("TCOST_VARIANTS", "base,leankey,leancausal,leanbcast,lean")
     for name, extra in VARIANTS.items():
         if only and name not in only.split(","):
             continue
@@ -67,13 +70,17 @@ def test_tile_cost_split():
         for l in lines:
             print(l, flush=True)
         if r.returncode or not lines:
-            print("TCOST " + json.dumps(dict(variant=name, error=r.stderr[-800:])), flush=True)
+            print("TCOST " + json.dumps(dict(variant=name, error=" | ".join(l for l in r.stderr.splitlines()
+                                   if "Error" in l or "error:" in l)[-1500:])), flush=True)
     import numpy as np
 
     for context in (24_000, 160_000):
+      for other in ("leankey", "leancausal", "leanbcast", "lean"):
+        if not os.path.exists(f"/tmp/tcost_{other}_{context}.npy"):
+            continue
         base = np.load(f"/tmp/tcost_base_{context}.npy")
-        lean = np.load(f"/tmp/tcost_lean_{context}.npy")
-        print("TCOST " + json.dumps(dict(variant="lean_vs_base", context=context,
+        lean = np.load(f"/tmp/tcost_{other}_{context}.npy")
+        print("TCOST " + json.dumps(dict(variant=other + "_vs_base", context=context,
               max_abs=float(np.nanmax(np.abs(lean - base))),
               nan=int(np.isnan(lean).sum()), identical=bool(np.array_equal(lean, base)))),
               flush=True)
