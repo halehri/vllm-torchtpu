@@ -56,12 +56,18 @@ def main():
                          "attn_dma, attn_matmul, keys, select")
     ap.add_argument("--shard", action="store_true",
                     help="request-sharded indexer (VLLM_TPU_MEGAKERNEL wholeshard=1)")
+    ap.add_argument("--slots", type=int, default=0,
+                    help="attention ring slots of the per-row path (0: the block default)")
     ap.add_argument("--union", action="store_true",
                     help="per-request union attention (VLLM_TPU_MEGAKERNEL wholeunion=1)")
     ap.add_argument("--loop", action="store_true",
                     help="per-request work in a fori_loop (VLLM_TPU_MEGAKERNEL wholeloop=1)")
     a = ap.parse_args()
     _apply_removals(a.remove)
+    if a.slots:
+        from vllm_torchtpu.megakernel.wholestep import qsa_full
+
+        qsa_full.QSAFullBlock.__init__.__kwdefaults__["slots"] = a.slots
     wsc.SHARD_INDEX, wsc.UNION_ATTN, wsc.LOOP_REQUESTS = a.shard, a.union, a.loop
     # The served Pallas mesh order (get_pallas_mesh in the server: [0, 1, 4, 5, 6, 7, 2, 3]).
     by_id = {d.id: d for d in jax.devices()}
