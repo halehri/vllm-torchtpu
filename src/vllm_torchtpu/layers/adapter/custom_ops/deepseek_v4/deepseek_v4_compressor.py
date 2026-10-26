@@ -270,14 +270,17 @@ class RunLocalStateSpec(SlidingWindowMLASpec):
         return False
 
     # The inherited grouping checks neither the spec type nor prefix
-    # caching, so it would fold a cacheable window of the same size into
-    # this group (or this state into a cacheable group).
+    # caching. These overrides only run when vLLM calls them on a
+    # RunLocalStateSpec, so they miss a mixed list led by a cacheable
+    # SlidingWindowMLASpec; DsV4KVCacheAllocator._classify_ds_v4_layers is
+    # the guard that covers both orders.
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
-        assert all(isinstance(spec, RunLocalStateSpec) for spec in specs), (
-            "RunLocalStateSpec cannot share a KV cache group with a "
-            "prefix-cacheable SlidingWindowMLASpec."
-        )
+        if not all(isinstance(spec, RunLocalStateSpec) for spec in specs):
+            raise ValueError(
+                "RunLocalStateSpec cannot share a KV cache group with a "
+                "prefix-cacheable SlidingWindowMLASpec."
+            )
         return super().merge(specs)
 
     def is_uniform_with_collection(
@@ -473,10 +476,11 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             isinstance(self.state_cache, VllmCompressorStateCache)
             and self.state_cache.run_local
         )
-        assert not (run_local and self.overlap), (
-            f"{self.prefix!r}: RunLocalStateSpec does not cache the previous "
-            "run's state, which an overlapping compressor kernel reads"
-        )
+        if run_local and self.overlap:
+            raise RuntimeError(
+                f"{self.prefix!r}: RunLocalStateSpec does not cache the previous "
+                "run's state, which an overlapping compressor kernel reads"
+            )
         mesh = get_pallas_op_mesh()
 
         assert self.head_dim in (512, 128), self.head_dim

@@ -174,7 +174,7 @@ def test_run_local_state_refuses_an_overlapping_kernel():
     compressor.prefix = "model.layers.0.self_attn.compressor"
     compressor.state_cache = _state_cache(128)
     compressor.overlap = True
-    with pytest.raises(AssertionError, match="overlapping compressor kernel"):
+    with pytest.raises(RuntimeError, match="overlapping compressor kernel"):
         compressor._build_compressor_op()
 
 
@@ -205,7 +205,7 @@ def _swa(block_size, window, head_size, cls=SlidingWindowMLASpec):
 def test_run_local_state_does_not_group_with_a_cacheable_window():
     run_local = _swa(SWA_BLOCK, 128, 1024, cls=RunLocalStateSpec)
     cacheable = _swa(SWA_BLOCK, 128, 1024)
-    with pytest.raises(AssertionError, match="cannot share a KV cache group"):
+    with pytest.raises(ValueError, match="cannot share a KV cache group"):
         RunLocalStateSpec.merge([run_local, cacheable])
     assert not run_local.is_uniform_with_collection({"a": run_local, "b": cacheable})
     merged = RunLocalStateSpec.merge([run_local, run_local])
