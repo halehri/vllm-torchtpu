@@ -11,13 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU-friendly rotary embeddings for vLLM-Omni Wan and LTX-2 models.
+"""TPU-friendly rotary embeddings for vLLM-Omni diffusion models.
 
-``RotaryEmbeddingWan.forward_native`` rotates (even, odd) pairs through
-``x.unflatten(-1, (-1, 2)).unbind(-1)`` and ``torch.stack(..., dim=-1)``.
-On TPU the size-2 minor dimension forces sequence-minor relayouts plus
-strided copies around every q/k rotation (the XLA "data formatting" and
-copy ops around each attention layer in a device profile).
+``RotaryEmbedding.forward_native`` (via ``x[..., ::2]`` / ``x[..., 1::2]``,
+``torch.stack(..., dim=-1)``, and ``rearrange(..., "... d two -> ... (d two)")``)
+and ``RotaryEmbeddingWan.forward_native`` (via ``x.unflatten(-1, (-1, 2))`` /
+``unbind(-1)`` and ``torch.stack(..., dim=-1).flatten(-2, -1)``) both rotate
+(even, odd) pairs through a ``(..., D/2, 2)`` intermediate tensor. On TPU
+that size-2 minor dimension cannot be bitcast in the 128-lane tile layout
+without 64x padding, so XLA's layout assignment permutes to sequence-minor
+layouts and inserts strided relayout copies around every q/k rotation (the
+XLA "data formatting" and copy ops around each attention layer in a device
+profile).
 
 The same rotation is written here on the natural ``(..., head_dim)``
 layout::
@@ -61,28 +66,63 @@ def _repeat_pairs(t: torch.Tensor) -> torch.Tensor:
 def apply_rotary_pair_swap(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> torch.Tensor:
-    """Interleaved RoPE of ``x`` (..., D) with half-dim ``cos``/``sin`` (..., D/2).
+    """Interleaved RoPE of ``x`` (..., D) with half-dim ``cos``/``sin`` (..., R/2).
 
-    In ``torch.bfloat16`` (the dtype Wan and LingBot-World pass after
+    Supports both full (``R == D``) and partial (``R < D``) rotary dimensions,
+    passing ``x[..., R:]`` through unchanged, and inserts the singleton head
+    axis when ``cos``/``sin`` are 2-D ``(S, R/2)`` or 3-D ``(B, S, R/2)``
+    tables (``cos.dim() == 2 or cos.dim() == x.dim() - 1``).
+
+    In ``torch.bfloat16`` (the dtype diffusion models pass after
     ``to(x.dtype)``), ``x @ P`` is bit-exact because each column of ``P``
     has a single ``+-1`` entry. In ``torch.float32``, TPU matmuls default
     to bf16 input rounding unless high precision is configured.
     """
-    swapped = torch.matmul(x, _pair_swap_matrix(x.shape[-1], x.dtype, x.device))
-    return (x * _repeat_pairs(cos) + swapped * _repeat_pairs(sin)).to(x.dtype)
+    if cos.dim() == 2 or cos.dim() == x.dim() - 1:
+        cos = cos.unsqueeze(-2)
+        sin = sin.unsqueeze(-2)
+    ro_dim = cos.shape[-1] * 2
+    x_rot = x if ro_dim == x.shape[-1] else x[..., :ro_dim]
+    swapped = torch.matmul(x_rot, _pair_swap_matrix(ro_dim, x.dtype, x.device))
+    rotated = (x_rot * _repeat_pairs(cos) + swapped * _repeat_pairs(sin)).to(x.dtype)
+    if ro_dim == x.shape[-1]:
+        return rotated
+    return torch.cat([rotated, x[..., ro_dim:]], dim=-1)
+
+
+def rotary_embedding_forward(
+    self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
+    """Drop-in ``RotaryEmbedding.forward`` for bf16 interleaved RoPE.
+
+    NeoX (``is_neox_style=True``) and non-bf16 calls fall back to
+    ``self._forward_method``.
+    """
+    if (
+        not self.interleaved
+        or x.dtype != torch.bfloat16
+        or cos.dtype != x.dtype
+        or sin.dtype != x.dtype
+    ):
+        return self._forward_method(x, cos, sin)
+    cos, sin = self._prepare_half_head_dim_cos_sin(cos, sin)
+    return apply_rotary_pair_swap(x, cos, sin)
 
 
 def rotary_embedding_wan_forward(
     self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> torch.Tensor:
-    """Drop-in ``RotaryEmbeddingWan.forward`` for bf16 interleaved half-dim tables."""
-    if not (self.interleaved and self.half_head_dim) or x.dtype != torch.bfloat16:
+    """Drop-in ``RotaryEmbeddingWan.forward`` for bf16 interleaved half-dim tables.
+
+    NeoX, full-dim, and non-bf16 calls fall back to ``self._forward_method``.
+    """
+    if (
+        not (self.interleaved and self.half_head_dim)
+        or x.dtype != torch.bfloat16
+        or cos.dtype != x.dtype
+        or sin.dtype != x.dtype
+    ):
         return self._forward_method(x, cos, sin)
-    # vLLM-Omni 0.32 (vllm-omni#8112) lets callers such as LingBot-World pass
-    # (tokens, D/2) tables; expand them to (1, S, 1, D/2) as forward_native does.
-    if cos.dim() == 2:
-        cos = cos.unsqueeze(0).unsqueeze(2)
-        sin = sin.unsqueeze(0).unsqueeze(2)
     return apply_rotary_pair_swap(x, cos, sin)
 
 
