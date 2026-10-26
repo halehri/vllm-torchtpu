@@ -16,7 +16,10 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+
+from .collectives import CollectiveTable
+from .measured import TPU7X_32R
 
 
 @dataclass(frozen=True)
@@ -30,6 +33,7 @@ class ChipSpec:
     fp8_flops: float
     vmem_bytes: int
     ici_bw: float = math.inf
+    collective_table: CollectiveTable | None = None
 
 
 CHIPS: dict[str, ChipSpec] = {
@@ -44,3 +48,8 @@ CHIPS: dict[str, ChipSpec] = {
         ici_bw=280.02e9,
     ),
 }
+
+# Same ceilings as tpu7x; collectives priced from measured 32-rank per-call times.
+CHIPS["tpu7x-measured"] = replace(
+    CHIPS["tpu7x"], name="tpu7x-measured", collective_table=TPU7X_32R
+)

@@ -43,6 +43,7 @@ class StepFloor:
     hard_floor_s: float
     serial_floor_s: float
     binding: str
+    extrapolated_chain_s: float = 0.0
 
 
 def _combine_modules(
@@ -60,8 +61,15 @@ def _combine_modules(
         if chip.ici_bw > 0 and math.isfinite(chip.ici_bw)
         else 0.0
     )
-    hops = sum(m.chain_hops for m in modules)
-    chain_s = hops * collective_latency_s + ici_s
+    extrap_s = 0.0
+    if chip.collective_table is None:
+        chain_s = sum(m.chain_hops for m in modules) * collective_latency_s + ici_s
+    else:
+        chain_s = 0.0
+        for c in (c for m in modules for c in m.collectives if c.group > 1):
+            t, src = chip.collective_table.time_s(c)
+            chain_s += t
+            extrap_s += t if src in ("extrapolated", "missing") else 0.0
     hard_floor_s = max(hbm_s, mm_s, chain_s)
     serial_floor_s = (
         sum(
@@ -77,7 +85,7 @@ def _combine_modules(
         binding = "hbm"
     elif hard_floor_s == mm_s:
         binding = "matmul"
-    elif collective_latency_s > 0.0:
+    elif collective_latency_s > 0.0 or chip.collective_table is not None:
         binding = "chain"
     else:
         binding = "ici"
@@ -90,6 +98,7 @@ def _combine_modules(
         hard_floor_s=hard_floor_s,
         serial_floor_s=serial_floor_s,
         binding=binding,
+        extrapolated_chain_s=extrap_s,
     )
 
 

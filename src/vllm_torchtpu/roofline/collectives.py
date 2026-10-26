@@ -15,7 +15,9 @@
 
 from __future__ import annotations
 
+import bisect
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -32,6 +34,8 @@ class Collective:
     wire_bytes: float  # bytes this rank sends
     hops: int  # serial steps this collective adds to the dependency chain
     offchip: float  # share of wire_bytes that leaves the chip
+    kind: Kind
+    payload: float  # AR/RS input, AG output, or push wire, in bytes
 
 
 def offchip_share(group: int, ranks_per_chip: int) -> float:
@@ -54,7 +58,7 @@ def make(
     Payload is the AR/RS input, AG output, or the push wire.
     """
     if group <= 1:
-        return Collective(name, group, 0.0, 0, 0.0)
+        return Collective(name, group, 0.0, 0, 0.0, kind, payload)
     n = group
     if kind == "push":
         wire, hops = payload, 1
@@ -68,7 +72,36 @@ def make(
     else:
         wire = (n - 1) / n * payload
         hops = n - 1 if algo == "ring" else 1
-    return Collective(name, n, wire, hops, offchip_share(n, ranks_per_chip))
+    return Collective(
+        name, n, wire, hops, offchip_share(n, ranks_per_chip), kind, payload
+    )
+
+
+@dataclass(frozen=True)
+class CollectiveTable:
+    """Measured per-call time by (name or kind, group) and payload.
+
+    Each payload keeps its raw samples; lookup uses their mean and interpolates
+    linearly between payloads. Outside the measured range it returns the
+    nearest payload's mean and source "extrapolated".
+    """
+
+    # key -> ((payload_B, (seconds, ...)), ...), payloads ascending and unique
+    rows: Mapping[tuple[str, int], tuple[tuple[float, tuple[float, ...]], ...]]
+
+    def time_s(self, c: Collective) -> tuple[float, str]:
+        pts = self.rows.get((c.name, c.group)) or self.rows.get((c.kind, c.group))
+        if not pts:
+            return 0.0, "missing"
+        xs = [p for p, _ in pts]
+        ys = [sum(s) / len(s) for _, s in pts]
+        if c.payload < xs[0] or c.payload > xs[-1]:
+            return (ys[0] if c.payload < xs[0] else ys[-1]), "extrapolated"
+        i = bisect.bisect_left(xs, c.payload)
+        if xs[i] == c.payload:
+            return ys[i], "measured"
+        x0, x1, y0, y1 = xs[i - 1], xs[i], ys[i - 1], ys[i]
+        return y0 + (y1 - y0) * (c.payload - x0) / (x1 - x0), "interpolated"
 
 
 def padded_rows(rows: int, tp: int, residual: str) -> int:
