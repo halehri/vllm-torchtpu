@@ -2088,7 +2088,12 @@ class StorageRankCoords:
 
     @property
     def storage_rank(self) -> int:
-        """Which of a block's shard files this rank writes."""
+        """Which of a block's shard files this rank writes.
+
+        Also the rank's index among its engine's workers: vLLM lays an
+        engine's ranks out PP x PCP x TP, the same order, so this is the
+        engine-local rank the store registers the worker under (node_id).
+        """
         return (
             self.pp_rank * (self.pcp_size * self.tp_size)
             + self.pcp_rank * self.tp_size
@@ -2105,7 +2110,8 @@ def worker_storage_rank_coords() -> StorageRankCoords:
     """This worker's storage coordinates, read from its TP, PCP, and PP groups.
 
     Not from the world rank: with data parallelism that counts the ranks of
-    every replica, while storage paths are per TP, PCP, and PP rank.
+    every replica, while storage paths, and the node id the store knows the
+    worker by, are per TP, PCP, and PP rank.
     """
     from vllm.distributed import parallel_state
 
@@ -2428,9 +2434,34 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
 
     def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
         if self._worker is None:
-            from vllm.distributed import parallel_state
-
-            rank = parallel_state.get_world_group().rank_in_group
+            # The worker's index within its engine, [0, world_size), from its
+            # TP, PCP, and PP group ranks: PP -> PCP -> TP major, the order
+            # vLLM lays an engine's ranks out in, so it is the engine-local
+            # rank and the storage shard index alike. The store registers the
+            # worker under it (node_id) and pairs transfers with a peer store
+            # on it -- this replica's worker k reads from the peer's worker k
+            # -- so k must name the same shard on every replica. Not the
+            # world group's rank: under data parallelism (DP + EP shares one
+            # torch.distributed world across the replicas) that is the global
+            # `dp_rank * world_size + k`, which the store -- one per replica,
+            # expecting node ids [0, world_size) -- rejects on every replica
+            # but the first once a global registry is configured.
+            coords = worker_storage_rank_coords()
+            # The store expects node ids in [0, world_size) and, with a
+            # storage tier, looks for a block's files under the shard count
+            # from the config; a worker that disagreed would register out of
+            # range or write where the store never looks.
+            assert (coords.tp_size, coords.pcp_size, coords.pp_size) == (
+                self.tp_size,
+                self.pcp_size,
+                self.pp_size,
+            ), (
+                "TPURaidenOffloadingConnector: worker group sizes TP="
+                f"{coords.tp_size}, PCP={coords.pcp_size}, PP={coords.pp_size} != "
+                f"configured TP={self.tp_size}, PCP={self.pcp_size}, "
+                f"PP={self.pp_size}"
+            )
+            rank = coords.storage_rank
             # Direct workers to dial the controller on store_server_ip when configured
             # (bind-and-advertise), falling back to loopback (127.0.0.1) for local runs.
             controller_address = (
@@ -2440,27 +2471,13 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             if self.storage_config is not None:
                 from tpu_sync.api.torch.kv_cache_manager import _torch_impl
 
-                coords = worker_storage_rank_coords()
-                # The store looks for a block's files under the shard count
-                # from the config; a worker that disagreed would write where
-                # the store never looks.
-                assert (coords.tp_size, coords.pcp_size, coords.pp_size) == (
-                    self.tp_size,
-                    self.pcp_size,
-                    self.pp_size,
-                ), (
-                    "TPURaidenOffloadingConnector: worker group sizes TP="
-                    f"{coords.tp_size}, PCP={coords.pcp_size}, PP={coords.pp_size} != "
-                    f"configured TP={self.tp_size}, PCP={self.pcp_size}, "
-                    f"PP={self.pp_size}"
-                )
                 backend_configs.append(
                     build_worker_storage_backend_config(
                         _torch_impl(), self.storage_config, coords
                     )
                 )
                 logger.info(
-                    "TPURaidenOffloadingConnector: rank %d writes storage shard "
+                    "TPURaidenOffloadingConnector: worker %d writes storage shard "
                     "%d of %d (TP rank %d, PCP rank %d, PP rank %d) under %s",
                     rank,
                     coords.storage_rank,
