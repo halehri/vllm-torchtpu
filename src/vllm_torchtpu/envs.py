@@ -99,6 +99,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
+    VLLM_TPU_QSA_PREFILL_LEAN: bool = False
     VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE: bool = False
     VLLM_TPU_QSA_DECODE_LEAN_FETCH: bool = False
     VLLM_TPU_QSA_DECODE_SLOT_READ: bool = False
@@ -614,6 +615,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_PREFILL_BF16_MXU": env_bool(
         "VLLM_TPU_QSA_PREFILL_BF16_MXU", default=False
     ),
+    # qwen4_exp QSA sparse prefill: exact per-tile trims (causal compare only
+    # on tiles reaching the block's queries, no key guard, per-head mask select).
+    "VLLM_TPU_QSA_PREFILL_LEAN": env_bool("VLLM_TPU_QSA_PREFILL_LEAN"),
     # Qwen4-exp pooled QSA decode/verify steps: write main KV, compressed
     # indexer keys and the raw ring/tags of a layer with one Pallas kernel
     # whose row DMAs are all in flight together, and read the ring with every

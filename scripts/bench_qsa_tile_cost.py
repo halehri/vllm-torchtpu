@@ -28,6 +28,7 @@ VARIANTS = {
     "noqk_nopv": {"QSA_PREFILL_ABLATE": "noqk,nopv"},
     "nodma": {"QSA_PREFILL_ABLATE": "nodma"},
     "bf16mxu": {"VLLM_TPU_QSA_PREFILL_BF16_MXU": "1"},
+    "lean": {"VLLM_TPU_QSA_PREFILL_LEAN": "1"},
 }
 
 CHILD = r"""
@@ -42,6 +43,9 @@ for context, groups, ratio in (b.BUCKETS[0], b.BUCKETS[-1]):
     tiles = min(-(-int(groups * b.RATIO * ratio) // b.KV_TILE), context // b.KV_TILE)
     inputs = b.make_inputs(rng, context, tiles * b.KV_TILE // b.RATIO, groups)
     out[context] = (tiles, b.timed(b.attend, *inputs))
+    import jax
+    np.save(f"/tmp/tcost_{sys.argv[1]}_{context}.npy",
+            np.asarray(jax.jit(b.attend)(*inputs)[0], np.float32))
 (t0, a), (t1, c) = out[b.BUCKETS[0][0]], out[b.BUCKETS[-1][0]]
 print("TCOST " + json.dumps(dict(variant=sys.argv[1], ms24=a, ms160=c, tiles24=t0,
       tiles160=t1, us_per_tile=(c - a) / (t1 - t0) * 1e3,
@@ -50,7 +54,10 @@ print("TCOST " + json.dumps(dict(variant=sys.argv[1], ms24=a, ms160=c, tiles24=t
 
 
 def test_tile_cost_split():
+    only = os.environ.get("TCOST_VARIANTS", "base,lean")
     for name, extra in VARIANTS.items():
+        if only and name not in only.split(","):
+            continue
         env = dict(os.environ)
         env.pop("QSA_PREFILL_ABLATE", None)
         env.update(extra)
@@ -61,3 +68,12 @@ def test_tile_cost_split():
             print(l, flush=True)
         if r.returncode or not lines:
             print("TCOST " + json.dumps(dict(variant=name, error=r.stderr[-800:])), flush=True)
+    import numpy as np
+
+    for context in (24_000, 160_000):
+        base = np.load(f"/tmp/tcost_base_{context}.npy")
+        lean = np.load(f"/tmp/tcost_lean_{context}.npy")
+        print("TCOST " + json.dumps(dict(variant="lean_vs_base", context=context,
+              max_abs=float(np.nanmax(np.abs(lean - base))),
+              nan=int(np.isnan(lean).sum()), identical=bool(np.array_equal(lean, base)))),
+              flush=True)

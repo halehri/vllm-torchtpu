@@ -226,6 +226,7 @@ def _kernel(
     bf16_mxu: bool = False,
     query_tile: int = 256,
     ablate: str = "",
+    lean: bool = False,
 ):
     block = pl.program_id(0)
     # The model produces BF16 queries.  A BF16 call boundary can avoid a large
@@ -347,7 +348,17 @@ def _kernel(
         visible = pieces[0] if parts == 1 else jnp.concatenate(pieces, axis=0)
         if "nomask" in ablate:  # bench-only: no bitset expansion
             visible = jnp.ones((query_block, kv_tile), jnp.bool_)
-        if "nocausal" not in ablate:  # bench-only switch
+        if lean:
+            # Only tiles reaching past the block's first query position need
+            # the causal compare; every earlier tile is visible to all rows.
+            visible = lax.cond(
+                logical + kv_tile - 1
+                <= jnp.min(jnp.where(positions >= 0, positions, jnp.iinfo(jnp.int32).max)),
+                lambda v: v,
+                lambda v: v & (logical + row[None, :] <= positions[:, None]),
+                visible,
+            )
+        elif "nocausal" not in ablate:  # bench-only switch
             visible &= logical + row[None, :] <= positions[:, None]
         written = logical + lax.broadcasted_iota(
             jnp.int32, (kv_tile, head_dim), 0
@@ -359,7 +370,11 @@ def _kernel(
                 key = key.astype(jnp.float32)
                 value = value.astype(jnp.float32)
                 if "nokvfix" not in ablate:  # bench-only switch
-                    key = jnp.where(jnp.isfinite(key) & written, key, 0)
+                    # A key only meets visible (written, finite) scores after
+                    # the mask select below, so lean skips its guard. Values
+                    # keep it: a masked probability is 0, and 0 x NaN is NaN.
+                    if not lean:
+                        key = jnp.where(jnp.isfinite(key) & written, key, 0)
                     value = jnp.where(jnp.isfinite(value) & written, value, 0)
             else:
                 key = jnp.where(written, key, 0)
@@ -397,7 +412,17 @@ def _kernel(
                     tile_visible[None, :, :],
                     (q_heads_per_kv, query_tile, kv_tile),
                 ).reshape(rows, kv_tile)
-                if "nowhere" not in ablate:  # bench-only switch
+                if lean:
+                    # Select per head on [heads, rows, cols] against the
+                    # unbroadcast [rows, cols] mask.
+                    score = jnp.where(
+                        tile_visible[None, :, :],
+                        (score * score_scale if bf16_mxu else score).reshape(
+                            q_heads_per_kv, query_tile, kv_tile
+                        ),
+                        -jnp.inf,
+                    ).reshape(rows, kv_tile)
+                elif "nowhere" not in ablate:  # bench-only switch
                     score = jnp.where(
                         row_visible,
                         score * score_scale if bf16_mxu else score,
@@ -695,6 +720,7 @@ def block_sparse_gqa_prefill(
             **({"bf16_mxu": True} if bf16_mxu else {}),
             query_tile=query_tile,
             ablate=os.environ.get("QSA_PREFILL_ABLATE", ""),
+            lean=bool(envs.VLLM_TPU_QSA_PREFILL_LEAN),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
