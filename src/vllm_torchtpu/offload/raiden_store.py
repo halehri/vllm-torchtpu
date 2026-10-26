@@ -78,8 +78,10 @@ from __future__ import annotations
 
 import enum
 import hashlib
+import inspect
 import math
 import os
+import re
 import socket
 import threading
 import time
@@ -281,6 +283,30 @@ class FinishedJob:
     failed_device_block_ids: list[int] = field(default_factory=list)
 
 
+def _store_supports_dp_rank(store_cls: Any) -> bool:
+    """Whether ``store_cls`` accepts the ``dp_rank`` keyword argument.
+
+    ``tpu_raiden_torch.KVCacheStore`` is a nanobind ``nb_type`` whose type-level
+    ``__call__`` reports ``(*args, **kwargs)`` while ``__init__`` carries the
+    real C++ constructor signature in ``__doc__``.
+    """
+    target = store_cls.__init__ if isinstance(store_cls, type) else store_cls
+    if target is object.__init__:
+        return False
+    try:
+        sig = inspect.signature(target)
+    except (TypeError, ValueError):
+        init_doc = getattr(getattr(store_cls, "__init__", None), "__doc__", None)
+        doc = init_doc if isinstance(init_doc, str) else ""
+        if not doc:
+            cls_doc = getattr(store_cls, "__doc__", None)
+            doc = cls_doc if isinstance(cls_doc, str) else ""
+        return re.search(r"\bdp_rank\b", doc) is not None
+    return "dp_rank" in sig.parameters or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+
+
 class RaidenOffloadingManager(OffloadingManager):
     """Scheduler-side OffloadingManager backed by raiden's KVCacheStore.
 
@@ -305,6 +331,7 @@ class RaidenOffloadingManager(OffloadingManager):
         # Storage tier behind the host DRAM pool: raiden BackendConfigs from
         # `build_store_storage_backend_config`. Empty keeps the store DRAM-only.
         secondary_backend_configs: Sequence[object] = (),
+        dp_rank: int = 0,
         # Test overrides: allow injecting mock store instance and type bindings.
         store: Any = None,
         store_types: Any = None,
@@ -312,6 +339,12 @@ class RaidenOffloadingManager(OffloadingManager):
         assert kernel_physical_blocks_capacity == (
             offload_logical_blocks_capacity * device_block_size_factor
         )
+        if dp_rank < 0:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: dp_rank must be non-negative, "
+                f"got {dp_rank}"
+            )
+        self._dp_rank = dp_rank
         self._capacity_keys = offload_logical_blocks_capacity
         self._device_block_size_factor = device_block_size_factor
         self._key_namespace = key_namespace
@@ -345,6 +378,17 @@ class RaidenOffloadingManager(OffloadingManager):
             from tpu_sync.api.torch.kv_cache_manager import _torch_impl
 
             store_types = _torch_impl()
+            dp_rank_kwargs: dict[str, int] = {}
+            if dp_rank != 0:
+                if _store_supports_dp_rank(store_types.KVCacheStore):
+                    dp_rank_kwargs["dp_rank"] = dp_rank
+                else:
+                    logger.warning(
+                        "TPURaidenOffloadingConnector: Raiden store predates "
+                        "dp_rank; KVCacheStore telemetry will label dp_rank as "
+                        "0 (configured dp_rank=%d).",
+                        dp_rank,
+                    )
             logger.info(
                 "TPURaidenOffloadingConnector: blocking KVCacheStore construction "
                 "until %d worker(s) register",
@@ -374,6 +418,7 @@ class RaidenOffloadingManager(OffloadingManager):
                     if secondary_backend_configs
                     else {}
                 ),
+                **dp_rank_kwargs,
             )
             logger.info(
                 "TPURaidenOffloadingConnector: KVCacheStore up: capacity=%d "
@@ -2360,6 +2405,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         dp_rank_local = vllm_config.parallel_config.data_parallel_rank_local
         if dp_rank_local is None:
             dp_rank_local = dp_rank
+        self.dp_rank = dp_rank
         self.raiden_controller_port = dp_rank_local + int(
             self.extra_config.get("raiden_controller_port", _DEFAULT_CONTROLLER_PORT)
         )
@@ -2423,6 +2469,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 kv_pool_group=self.kv_pool_group,
                 key_namespace=self.key_namespace,
                 secondary_backend_configs=secondary_backend_configs,
+                dp_rank=self.dp_rank,
             )
         return self._manager
 

@@ -2616,7 +2616,15 @@ def _worker_config(bytes_per_block, *, num_blocks=1):
     )
 
 
-def _build_spec(extra_config, *, tp_size=4, pp_size=1, pcp_size=1):
+def _build_spec(
+    extra_config,
+    *,
+    tp_size=4,
+    pp_size=1,
+    pcp_size=1,
+    dp_rank=0,
+    dp_rank_local=None,
+):
     """A real TPURaidenStoreOffloadingSpec over stub configs, with kernel
     geometry, the block-major contract, and the namespace patched out. Under
     pipeline parallelism the spec needs the recorded all-ranks bytes, so
@@ -2648,8 +2656,10 @@ def _build_spec(extra_config, *, tp_size=4, pp_size=1, pcp_size=1):
     vllm_config.kv_events_config.enable_kv_cache_events = False
     vllm_config.model_config.is_hybrid = False
     vllm_config.model_config.model = "org/model"
-    vllm_config.parallel_config.data_parallel_rank = 0
-    vllm_config.parallel_config.data_parallel_rank_local = 0
+    vllm_config.parallel_config.data_parallel_rank = dp_rank
+    vllm_config.parallel_config.data_parallel_rank_local = (
+        dp_rank if dp_rank_local is None else dp_rank_local
+    )
     kv_cache_config = SimpleNamespace(
         kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())],
         kv_cache_tensors=[object()],
@@ -3248,9 +3258,21 @@ class TestStorageSpec(unittest.TestCase):
     def test_off_passes_no_configs(self):
         spec = _build_spec({})
         self.assertIsNone(spec.storage_config)
+        self.assertEqual(spec.dp_rank, 0)
         manager_kwargs, worker_kwargs = self._get_manager_and_worker(spec)
         self.assertEqual(manager_kwargs["secondary_backend_configs"], [])
+        self.assertEqual(manager_kwargs["dp_rank"], 0)
         self.assertEqual(worker_kwargs["backend_configs"], [])
+
+    def test_global_dp_rank_forwarded_to_manager(self):
+        # Multi-host DP: port offsets by local DP rank while KVCacheStore
+        # telemetry and RaidenId suffix use the global DP rank.
+        spec = _build_spec({}, dp_rank=3, dp_rank_local=1)
+        self.assertEqual(spec.dp_rank, 3)
+        manager_kwargs, _ = self._get_manager_and_worker(spec)
+        self.assertEqual(manager_kwargs["dp_rank"], 3)
+        self.assertEqual(manager_kwargs["raiden_controller_port"], 51516)
+        self.assertEqual(manager_kwargs["raiden_job_name"], "vllm-offload-engine-dp3")
 
     def test_on_configures_store_and_worker(self):
         spec = _build_spec(
@@ -3388,6 +3410,99 @@ class TestStoragePlumbing(unittest.TestCase):
         plain, tiered = self.store_kwargs
         self.assertNotIn("secondary_backend_configs", plain)
         self.assertEqual(tiered["secondary_backend_configs"], [cfg])
+
+    def test_store_gets_dp_rank_only_when_nonzero(self):
+        make_manager(None)
+        make_manager(None, dp_rank=2)
+        plain, multi_dp = self.store_kwargs
+        self.assertNotIn("dp_rank", plain)
+        self.assertEqual(multi_dp["dp_rank"], 2)
+        with self.assertRaisesRegex(ValueError, "dp_rank must be non-negative"):
+            make_manager(None, dp_rank=-1)
+
+    def test_store_handles_nanobind_and_legacy_dp_rank_signatures(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        captured: list[dict] = []
+
+        class _NanobindInitDescriptor:
+            """Emulates nanobind's nb_method __init__: uninspectable by
+            inspect.signature on the class, carrying the C++ signature in
+            __doc__."""
+
+            def __init__(self, doc: str):
+                self.__doc__ = doc
+
+            def __get__(self, obj, objtype=None):
+                if obj is None:
+                    return self
+
+                def _bound(**kwargs):
+                    captured.append(kwargs)
+                    obj.raiden_id = object()
+                    obj.raiden_controller_address = "127.0.0.1:0"
+                    obj.store_server_address = ""
+
+                return _bound
+
+        class _NanobindStoreBase:
+            def set_eviction_callback(self, callback):
+                pass
+
+        class OldNanobindStore(_NanobindStoreBase):
+            __init__ = _NanobindInitDescriptor(
+                "__init__(self, capacity: int, kv_pool_group: str = '') -> None"
+            )
+
+        class NewNanobindStore(_NanobindStoreBase):
+            __init__ = _NanobindInitDescriptor(
+                "__init__(self, capacity: int, kv_pool_group: str = '', "
+                "dp_rank: int = 0) -> None"
+            )
+
+        class LegacyPythonStore(_NanobindStoreBase):
+            def __init__(
+                self,
+                *,
+                capacity,
+                raiden_id,
+                num_shards,
+                shard_size_bytes,
+                raiden_controller_port,
+                global_registry_address,
+                store_server_ip,
+                kv_pool_group,
+                expected_worker_count,
+            ):
+                captured.append({"capacity": capacity})
+                self.raiden_id = raiden_id
+                self.raiden_controller_address = "127.0.0.1:0"
+                self.store_server_address = ""
+
+        for store_cls, expects_dp_rank in (
+            (OldNanobindStore, False),
+            (NewNanobindStore, True),
+            (LegacyPythonStore, False),
+        ):
+            with self.subTest(store_cls=store_cls.__name__):
+                captured.clear()
+                impl = SimpleNamespace(
+                    KVCacheStore=store_cls,
+                    RaidenId=lambda *args: args,
+                    BlockStatus=FakeBlockStatus,
+                    RaidenBlockId=FakeRaidenBlockId,
+                )
+                with (
+                    _fake_tpu_sync(impl),
+                    patch.object(rs.logger, "warning") as warning,
+                ):
+                    make_manager(None, dp_rank=2)
+                if expects_dp_rank:
+                    self.assertEqual(captured[0]["dp_rank"], 2)
+                    warning.assert_not_called()
+                else:
+                    self.assertNotIn("dp_rank", captured[0])
+                    warning.assert_called_once()
 
     def _start_worker(self, **kwargs):
         import torch
