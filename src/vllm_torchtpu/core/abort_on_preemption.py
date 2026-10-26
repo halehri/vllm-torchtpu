@@ -1,10 +1,29 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Capacity preemption errors for KV consumers with kv_load_failure_policy='fail'.
 
+Enabled automatically when ``kv_role == 'kv_consumer'`` and
+``kv_load_failure_policy == 'fail'`` (upstream default), or overridden explicitly
+via ``additional_config['abort_on_preemption']`` (``bool``).
+
 Enabled scheduler instances wrap ``_preempt_request`` and ``update_from_output``
-so decode requests evicted under KV cache capacity pressure terminate with a
-structured error instead of re-entering ``waiting`` to recompute prompts
-locally, while keeping ``reset_prefix_cache`` administrative preemption intact.
+so ``RUNNING`` decode requests evicted under KV cache capacity pressure terminate
+with ``finish_reason=FinishReason.ERROR``, ``stop_reason='kv_cache_preempted'``,
+and ``kv_transfer_params['kv_transfer_error']`` (``status_code=500``,
+``status_name='model.KVCachePreempt'``) instead of re-entering ``waiting`` to
+recompute prompts locally, while keeping ``reset_prefix_cache`` administrative
+preemption intact.
 """
 
 from functools import wraps
@@ -75,6 +94,8 @@ class _CapacityPreemption:
             "Capacity preemption requires a RUNNING victim: "
             f"request_id={request.request_id}, status={request.status}"
         )
+        # Preserve preemption metrics and event timeline so capacity evictions
+        # remain observable alongside FinishReason.ERROR.
         request.num_preemptions += 1
         if scheduler.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
@@ -101,6 +122,10 @@ class _CapacityPreemption:
             ),
         )
         scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ERROR)
+        assert request.request_id not in scheduler.requests, (
+            "Capacity preemption abort requires immediate block release: "
+            f"request_id={request.request_id}"
+        )
         scheduler.reset_preempted_req_ids.add(request.request_id)
         logger.warning(
             "Aborted capacity-preempted request_id=%s error=model.KVCachePreempt",

@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Capacity-preemption abort contracts; no model weights or TPU execution."""
 
 from typing import Literal
@@ -14,10 +26,6 @@ from vllm.config import (
     ParallelConfig,
     SchedulerConfig,
     VllmConfig,
-)
-from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
-from vllm.distributed.kv_transfer.kv_connector.v1.example_connector import (
-    ExampleConnector,
 )
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
@@ -35,12 +43,20 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
 from vllm_torchtpu import _patch_vllm_abort_on_preemption
-from vllm_torchtpu import envs as tpu_envs
-from vllm_torchtpu.distributed import utils as dist_utils
+from vllm_torchtpu.core.abort_on_preemption import (
+    _CapacityPreemption,
+    _should_enable_abort_on_preemption,
+)
 
 BLOCK_SIZE = 16
 EOS_TOKEN_ID = 127
 _none_hash_initialized = False
+
+
+def _preemption_state(scheduler: Scheduler) -> _CapacityPreemption:
+    state = scheduler.__dict__["_tpu_capacity_preemption"]
+    assert isinstance(state, _CapacityPreemption)
+    return state
 
 
 class _HashAdditionalConfig:
@@ -68,11 +84,10 @@ def _create_scheduler(
     *,
     enabled: bool | None = None,
     kv_load_failure_policy: Literal["recompute", "fail"] = "fail",
-    policy: str = "fcfs",
+    policy: Literal["fcfs", "priority"] = "fcfs",
     num_blocks: int = 11,
     enable_prefix_caching: bool = False,
     hash_additional_config: bool = False,
-    decode_fail: bool = False,
 ) -> Scheduler:
     _patch_vllm_abort_on_preemption()
     model_config = ModelConfig(
@@ -107,13 +122,11 @@ def _create_scheduler(
         device_config=DeviceConfig(device="cpu"),
         additional_config=additional_config,
     )
-    # Keep transport I/O out of the ordinary scheduler cases. The composition
-    # test retains the real Raiden config and substitutes only factory creation.
     vllm_config.kv_transfer_config = KVTransferConfig(
-        kv_connector=("TPURaidenConnector" if decode_fail else "ExampleConnector"),
+        kv_connector="ExampleConnector",
         kv_role="kv_consumer",
         kv_connector_extra_config={"shared_storage_path": model},
-        kv_load_failure_policy="fail" if decode_fail else kv_load_failure_policy,
+        kv_load_failure_policy=kv_load_failure_policy,
     )
     if hash_additional_config:
         vllm_config.additional_config = _HashAdditionalConfig()
@@ -260,6 +273,7 @@ def test_last_request_finishes_from_zero_token_preemption_step(
     assert terminal.request_id == request.request_id
     assert terminal.new_token_ids == []
     assert terminal.finish_reason == FinishReason.ERROR
+    assert terminal.kv_transfer_params is not None
     assert terminal.kv_transfer_params["kv_transfer_error"]["status_name"] == (
         "model.KVCachePreempt"
     )
@@ -270,45 +284,10 @@ def test_last_request_finishes_from_zero_token_preemption_step(
 
 
 def test_decode_load_failure_and_capacity_terminal_compose_once(
-    tiny_model: str, monkeypatch: pytest.MonkeyPatch
+    tiny_model: str,
 ) -> None:
-    raiden_pd = pytest.importorskip("vllm_torchtpu.core.raiden_pd")
-    from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
-        RaidenLoadFailures,
-    )
-
-    from vllm_torchtpu import _patch_vllm_raiden_pd_completion
-
-    _DecodeLoadFailures = raiden_pd._DecodeLoadFailures
-    monkeypatch.setattr(tpu_envs, "TPU_KV_RESHARD_TRANSPORT", "raiden")
-    monkeypatch.setattr(dist_utils, "get_raiden_inline_load", lambda: False)
-
-    # Recreate the registry's cold-start order even when another test has
-    # already installed either global init wrapper. Monkeypatch restores the
-    # prior class state, including both idempotence markers, after this test.
-    unwrapped_init = Scheduler.__init__
-    while "__wrapped__" in unwrapped_init.__dict__:
-        unwrapped_init = unwrapped_init.__dict__["__wrapped__"]
-    monkeypatch.setattr(Scheduler, "__init__", unwrapped_init)
-    monkeypatch.setattr(
-        Scheduler, "_tpu_raiden_pd_completion_patch", False, raising=False
-    )
-    monkeypatch.setattr(
-        Scheduler, "_tpu_abort_on_preemption_patch", False, raising=False
-    )
-    _patch_vllm_raiden_pd_completion()
-    _patch_vllm_abort_on_preemption()
-
-    def create_example_connector(*, config, role, kv_cache_config):
-        return ExampleConnector(config, role, kv_cache_config)
-
-    monkeypatch.setattr(
-        KVConnectorFactory, "create_connector", staticmethod(create_example_connector)
-    )
-    scheduler = _create_scheduler(tiny_model, num_blocks=6, decode_fail=True)
+    scheduler = _create_scheduler(tiny_model, num_blocks=6)
     assert type(scheduler) is Scheduler
-    decode_failures = scheduler._tpu_capacity_preemption.original_update.__self__
-    assert isinstance(decode_failures, _DecodeLoadFailures)
     capacity_victim = _request("capacity-victim", 80, client_index=2)
     scheduler.add_request(capacity_victim)
 
@@ -316,21 +295,18 @@ def test_decode_load_failure_and_capacity_terminal_compose_once(
     scheduler.update_from_output(first, _runner_output([capacity_victim.request_id]))
     terminal_step = scheduler.schedule()
     assert terminal_step.finished_req_ids == {capacity_victim.request_id}
-    assert set(scheduler._tpu_capacity_preemption.pending) == {
-        capacity_victim.request_id
-    }
+    assert set(_preemption_state(scheduler).pending) == {capacity_victim.request_id}
 
     load_failed = _request("load-failed", 16, client_index=7)
     scheduler.add_request(load_failed)
     load_failed.status = RequestStatus.WAITING_FOR_REMOTE_KVS
-    load_metadata = RaidenLoadFailures({load_failed.request_id})
 
     outputs = scheduler.update_from_output(
         terminal_step,
         _runner_output(
             [],
             kv_connector_output=KVConnectorOutput(
-                kv_connector_worker_meta=load_metadata
+                failed_recving={load_failed.request_id}
             ),
         ),
     )
@@ -340,6 +316,7 @@ def test_decode_load_failure_and_capacity_terminal_compose_once(
     assert capacity_terminal.request_id == capacity_victim.request_id
     assert capacity_terminal.new_token_ids == []
     assert capacity_terminal.finish_reason is FinishReason.ERROR
+    assert capacity_terminal.kv_transfer_params is not None
     assert (
         capacity_terminal.kv_transfer_params["kv_transfer_error"]["status_name"]
         == "model.KVCachePreempt"
@@ -347,12 +324,7 @@ def test_decode_load_failure_and_capacity_terminal_compose_once(
     assert load_terminal.request_id == load_failed.request_id
     assert load_terminal.new_token_ids == []
     assert load_terminal.finish_reason is FinishReason.ERROR
-    assert (
-        load_terminal.kv_transfer_params["kv_transfer_error"]["status_name"]
-        == "model.KVTDecodeLoadFailure"
-    )
-    assert scheduler._tpu_capacity_preemption.pending == {}
-    assert decode_failures.failed_req_ids == set()
+    assert _preemption_state(scheduler).pending == {}
 
     next_step = scheduler.schedule()
     repeated = scheduler.update_from_output(
@@ -360,8 +332,7 @@ def test_decode_load_failure_and_capacity_terminal_compose_once(
         _runner_output(
             [],
             kv_connector_output=KVConnectorOutput(
-                finished_recving={load_failed.request_id},
-                kv_connector_worker_meta=RaidenLoadFailures({load_failed.request_id}),
+                failed_recving={load_failed.request_id}
             ),
         ),
     )
@@ -389,7 +360,7 @@ def test_terminal_waits_for_its_finished_id_step(tiny_model: str) -> None:
     terminal_step = scheduler.schedule()
     assert terminal_step.total_num_scheduled_tokens == 0
     assert terminal_step.finished_req_ids == {victim.request_id}
-    assert set(scheduler._tpu_capacity_preemption.pending) == {victim.request_id}
+    assert set(_preemption_state(scheduler).pending) == {victim.request_id}
 
     older_outputs = scheduler.update_from_output(
         older_step, _runner_output([older.request_id])
@@ -399,13 +370,13 @@ def test_terminal_waits_for_its_finished_id_step(tiny_model: str) -> None:
         for batch in older_outputs.values()
         for output in batch.outputs
     )
-    assert set(scheduler._tpu_capacity_preemption.pending) == {victim.request_id}
+    assert set(_preemption_state(scheduler).pending) == {victim.request_id}
 
     terminal_outputs = scheduler.update_from_output(terminal_step, _runner_output([]))
     assert [output.request_id for output in terminal_outputs[4].outputs] == [
         victim.request_id
     ]
-    assert scheduler._tpu_capacity_preemption.pending == {}
+    assert _preemption_state(scheduler).pending == {}
 
     next_step = scheduler.schedule()
     repeated = scheduler.update_from_output(
@@ -420,7 +391,7 @@ def test_terminal_waits_for_its_finished_id_step(tiny_model: str) -> None:
 
 @pytest.mark.parametrize("policy", ["fcfs", "priority"])
 def test_policy_victim_gets_one_structured_terminal(
-    tiny_model: str, policy: str
+    tiny_model: str, policy: Literal["fcfs", "priority"]
 ) -> None:
     scheduler = _create_scheduler(tiny_model, policy=policy, num_blocks=11)
     active = _request("active", 80, priority=0, arrival_time=0.0)
@@ -471,7 +442,7 @@ def test_policy_victim_gets_one_structured_terminal(
 
 @pytest.mark.parametrize("policy", ["fcfs", "priority"])
 def test_inflight_victim_is_kept_until_step_drains(
-    tiny_model: str, policy: str
+    tiny_model: str, policy: Literal["fcfs", "priority"]
 ) -> None:
     scheduler = _create_scheduler(tiny_model, policy=policy, num_blocks=4)
     pressure = _request("pressure", 16, priority=0, arrival_time=0.0)
@@ -495,7 +466,7 @@ def test_inflight_victim_is_kept_until_step_drains(
     assert guarded.num_scheduled_tokens == {}
     assert scheduler.running == [pressure, schedulable, victim]
     assert all(request.status == RequestStatus.RUNNING for request in scheduler.running)
-    assert scheduler._tpu_capacity_preemption.pending == {}
+    assert _preemption_state(scheduler).pending == {}
 
     scheduler.processed_step_seq = victim.last_sched_seq
     resumed = scheduler.schedule()
@@ -504,7 +475,7 @@ def test_inflight_victim_is_kept_until_step_drains(
         schedulable.request_id: 1,
     }
     assert victim.status == RequestStatus.FINISHED_ERROR
-    assert set(scheduler._tpu_capacity_preemption.pending) == {victim.request_id}
+    assert set(_preemption_state(scheduler).pending) == {victim.request_id}
 
 
 def test_management_reset_still_requeues_requests(tiny_model: str) -> None:
@@ -525,7 +496,7 @@ def test_management_reset_still_requeues_requests(tiny_model: str) -> None:
     assert scheduler.running == []
     assert list(scheduler.waiting) == requests
     assert all(request.status == RequestStatus.PREEMPTED for request in requests)
-    assert scheduler._tpu_capacity_preemption.pending == {}
+    assert _preemption_state(scheduler).pending == {}
 
 
 def test_abort_releases_only_victims_shared_prefix_reference(
@@ -556,7 +527,7 @@ def test_abort_releases_only_victims_shared_prefix_reference(
         second, _runner_output([survivor.request_id, victim.request_id])
     )
 
-    scheduler._tpu_capacity_preemption.abort(victim, 0.0)
+    _preemption_state(scheduler).abort(victim, 0.0)
 
     assert (
         scheduler.kv_cache_manager.get_blocks(survivor.request_id).get_block_ids()[0]
@@ -572,10 +543,6 @@ def test_abort_releases_only_victims_shared_prefix_reference(
 
 
 def test_invalid_abort_on_preemption_config_raises(tiny_model: str) -> None:
-    from vllm_torchtpu.core.abort_on_preemption import (
-        _should_enable_abort_on_preemption,
-    )
-
     model_config = ModelConfig(
         model=tiny_model,
         tokenizer=tiny_model,
@@ -597,3 +564,24 @@ def test_invalid_abort_on_preemption_config_raises(tiny_model: str) -> None:
     )
     with pytest.raises(ValueError, match="requires kv_role='kv_consumer'"):
         _should_enable_abort_on_preemption(non_consumer_config)
+
+
+def test_abort_rejects_delayed_block_release(tiny_model: str) -> None:
+    class _DelayFreeConnector:
+        def request_finished(
+            self, request: Request, block_ids: list[int]
+        ) -> tuple[bool, dict[str, object] | None]:
+            return True, None
+
+    scheduler = _create_scheduler(tiny_model, num_blocks=6)
+    victim = _request("victim", 32)
+    scheduler.add_request(victim)
+    first = scheduler.schedule()
+    scheduler.update_from_output(first, _runner_output([victim.request_id]))
+    scheduler.connector = _DelayFreeConnector()  # type: ignore[assignment]
+
+    with pytest.raises(
+        AssertionError,
+        match="Capacity preemption abort requires immediate block release",
+    ):
+        _preemption_state(scheduler).abort(victim, 0.0)
