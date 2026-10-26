@@ -1551,6 +1551,60 @@ def _patch_vllm_reset_compile_wrapper() -> None:
     )
 
 
+def _piecewise_io_probe():
+    """Debug: describe a compiled piecewise graph's outputs and mutated inputs.
+
+    With `VLLM_TPU_DEBUG_PIECEWISE_IO=K`, rank 0 logs, for calls K and K+1 of
+    each piecewise runnable, every output's shape, strides, storage offset and
+    whether it is a view (torch-tpu rebuilds a view output after each call in a
+    separate as_strided program), and every tensor argument whose version
+    counter the call advanced (an input mutation, written back by eager copy_
+    programs). Returns None when unset, so the serving path is untouched.
+    """
+    import os
+
+    spec = os.environ.get("VLLM_TPU_DEBUG_PIECEWISE_IO", "")
+    if not spec:
+        return None
+    first = int(spec)
+    calls: dict[int, int] = {}
+
+    def describe(t):
+        base = t._base
+        return (
+            f"{tuple(t.shape)} {t.dtype} stride={t.stride()} "
+            f"offset={t.storage_offset()} view_of="
+            f"{None if base is None else tuple(base.shape)}"
+        )
+
+    def probe(range_entry, args, kwargs):
+        import torch
+        import torch.distributed as dist
+
+        key = id(range_entry)
+        n = calls[key] = calls.get(key, 0) + 1
+        if not (first <= n < first + 2) or (
+            dist.is_initialized() and dist.get_rank() != 0
+        ):
+            return range_entry.runnable(*args, **kwargs)
+        tensors = [
+            (i, a) for i, a in enumerate(args) if isinstance(a, torch.Tensor)
+        ]
+        before = [a._version for _, a in tensors]
+        out = range_entry.runnable(*args, **kwargs)
+        flat = out if isinstance(out, (list, tuple)) else (out,)
+        tag = f"piecewise io {range_entry.compile_range} call {n}"
+        for j, o in enumerate(flat):
+            if isinstance(o, torch.Tensor):
+                logger.info("%s: out[%d] %s", tag, j, describe(o))
+        for (i, a), v in zip(tensors, before):
+            if a._version != v:
+                logger.info("%s: mutated arg[%d] %s", tag, i, describe(a))
+        return out
+
+    return probe
+
+
 def _patch_vllm_piecewise_backend() -> None:
     """Pick the compiled token-count bucket from a tensor's leading dimension.
 
@@ -1608,8 +1662,11 @@ def _patch_vllm_piecewise_backend() -> None:
             "PiecewiseBackend.__init__. "
             f"range_entry={range_entry.compile_range}"
         )
+        if probe is not None:
+            return probe(range_entry, args, kwargs)
         return range_entry.runnable(*args, **kwargs)
 
+    probe = _piecewise_io_probe()
     patched_call._tpu_piecewise_backend_patch = True
     PiecewiseBackend.__call__ = patched_call
     logger.info("Applied TPU patch: PiecewiseBackend tensor-dim-0 bucket dispatch.")
