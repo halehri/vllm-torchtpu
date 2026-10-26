@@ -881,7 +881,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
 
     def forward(self, input_ids, positions, inputs_embeds=None, **kwargs):
-        if envs.VLLM_TPU_QSA_UNION_STATS >= 0:
+        if envs.VLLM_TPU_QSA_UNION_STATS >= 0 or envs.VLLM_TPU_QSA_RUN_STATS >= 0:
             self._log_union_stats()
         # The route reads the padded bucket size outside both compiled graphs.
         if self.model_sp is None:
@@ -901,9 +901,13 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             return
         from vllm_torchtpu.kernels.qwen4_exp.union_stats import format_stats
 
+        from vllm_torchtpu.kernels.qwen4_exp.run_stats import format_run_stats
+
         for name, buffer in self.named_buffers():
             if name.endswith("union_stats"):
                 print(f"qsa union stats {name}: {format_stats(buffer.cpu().tolist())}", flush=True)
+            elif name.endswith("run_stats"):
+                print(f"qsa run stats {name}: {format_run_stats(buffer.cpu().tolist())}", flush=True)
 
     def embed_input_ids(self, input_ids):
         return self.model.embed_tokens(input_ids)

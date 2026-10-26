@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
     VLLM_TPU_QSA_TOPK_STATS: int = 0
     VLLM_TPU_QSA_UNION_STATS: int = -1
+    VLLM_TPU_QSA_RUN_STATS: int = -1
     VLLM_TPU_QSA_UNION_STATS_EVERY: int = 200
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
     VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK: int = 256
@@ -510,6 +511,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # a device buffer and logged every VLLM_TPU_QSA_UNION_STATS_EVERY forwards.
     # -1: off.
     "VLLM_TPU_QSA_UNION_STATS": lambda: int(os.getenv("VLLM_TPU_QSA_UNION_STATS", "-1")),
+    # Debug: decode selection run lengths of this QSA layer (-1: off), printed
+    # with the union stats every VLLM_TPU_QSA_UNION_STATS_EVERY forward calls.
+    "VLLM_TPU_QSA_RUN_STATS": lambda: int(os.getenv("VLLM_TPU_QSA_RUN_STATS", "-1")),
     "VLLM_TPU_QSA_UNION_STATS_EVERY": env_nonnegative_int(
         "VLLM_TPU_QSA_UNION_STATS_EVERY", 200
     ),

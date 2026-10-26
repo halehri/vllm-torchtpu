@@ -387,6 +387,25 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             norm_eps=float(self.q_norm.variance_epsilon),
             rotary_dim=int(self.head_dim * config.partial_rotary_factor),
         )
+        # Debug only (VLLM_TPU_QSA_RUN_STATS = this layer's index): decode
+        # selection run lengths, accumulated in a device buffer.
+        self._run_stats_op = None
+        if (
+            envs.VLLM_TPU_QSA_RUN_STATS >= 0
+            and layer is not None
+            and "mtp" not in prefix
+            and int(layer.group(1)) == envs.VLLM_TPU_QSA_RUN_STATS
+        ):
+            from vllm_torchtpu.kernels.qwen4_exp.run_stats import (
+                STATS as RUN_STATS,
+                build_run_stats_op,
+            )
+
+            self._run_stats_op = build_run_stats_op()
+            self.register_buffer(
+                "run_stats", torch.zeros(RUN_STATS, dtype=torch.int32, device=device),
+                persistent=False,
+            )
 
     @staticmethod
     def _token_shard_mode(tp_size, pooled, max_num_seqs):
@@ -753,6 +772,8 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         )
         if getattr(self, "_union_stats_op", None) is not None and rows is None:
             self.union_stats.copy_(self._union_stats_op(selected, self.union_stats))
+        if getattr(self, "_run_stats_op", None) is not None and rows is None:
+            self.run_stats.copy_(self._run_stats_op(selected, self.run_stats))
         if pick_rows:
             keep = (rows >= 0)[:, None]
             picked = rows.clamp_min(0)
