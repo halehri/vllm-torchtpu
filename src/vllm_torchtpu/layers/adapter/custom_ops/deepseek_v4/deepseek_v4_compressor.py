@@ -360,9 +360,14 @@ class VllmCompressorStateCache(CompressorStateCache):
             ) from exc
         return block_size
 
+    @property
+    def run_local(self) -> bool:
+        """Whether the state window is one compressed run (RunLocalStateSpec)."""
+        return self.sliding_window == self.compress_ratio
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         kv_cache_block_size = vllm_config.cache_config.block_size
-        run_local = self.sliding_window == self.compress_ratio
+        run_local = self.run_local
         # Run-local state is only safe if every prefix hit lands on a run start.
         if run_local and kv_cache_block_size % self.compress_ratio:
             raise ValueError(
@@ -462,6 +467,16 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         return op
 
     def _build_compressor_op(self):
+        # RunLocalStateSpec leaves the state before a prefix hit uncached, so
+        # the kernel must not read the previous run's state: no overlap.
+        run_local = (
+            isinstance(self.state_cache, VllmCompressorStateCache)
+            and self.state_cache.run_local
+        )
+        assert not (run_local and self.overlap), (
+            f"{self.prefix!r}: RunLocalStateSpec does not cache the previous "
+            "run's state, which an overlapping compressor kernel reads"
+        )
         mesh = get_pallas_op_mesh()
 
         assert self.head_dim in (512, 128), self.head_dim

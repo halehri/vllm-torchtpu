@@ -166,6 +166,18 @@ def test_run_local_state_refuses_a_block_size_off_the_run_grid():
         )
 
 
+def test_run_local_state_refuses_an_overlapping_kernel():
+    # An overlapping window also reads the previous run, which a prefix hit
+    # leaves as uncached null blocks under RunLocalStateSpec.
+    compressor = VllmDeepseekCompressor.__new__(VllmDeepseekCompressor)
+    torch.nn.Module.__init__(compressor)
+    compressor.prefix = "model.layers.0.self_attn.compressor"
+    compressor.state_cache = _state_cache(128)
+    compressor.overlap = True
+    with pytest.raises(AssertionError, match="overlapping compressor kernel"):
+        compressor._build_compressor_op()
+
+
 # RunLocalStateSpec on vLLM's KVCacheManager with DeepSeek-V4-shaped groups at
 # --block-size 1024: hits are unchanged, the HCA state group caches nothing and
 # is left out of the KV offload groups.
