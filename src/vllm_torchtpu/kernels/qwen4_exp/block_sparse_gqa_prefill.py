@@ -2,6 +2,7 @@
 """QSA block-sparse prefill with query-block reuse across paged KV tiles."""
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -224,6 +225,7 @@ def _kernel(
     kv_head_offset: int = 0,
     bf16_mxu: bool = False,
     query_tile: int = 256,
+    ablate: str = "",
 ):
     block = pl.program_id(0)
     # The model produces BF16 queries.  A BF16 call boundary can avoid a large
@@ -279,10 +281,14 @@ def _kernel(
         return copies
 
     def start_tile(tile, kv_ref, sem_ref):
+        if "nodma" in ablate:  # bench-only: no KV copies
+            return
         for copy in copy_tiles(tile, kv_ref, sem_ref):
             copy.start()
 
     def wait_tile(tile, kv_ref, sem_ref):
+        if "nodma" in ablate:  # bench-only switch
+            return
         for copy in copy_tiles(tile, kv_ref, sem_ref):
             copy.wait()
 
@@ -339,7 +345,10 @@ def _kernel(
                 group_in_tile = row // ratio
                 pieces.append(((word[:, None] >> group_in_tile[None, :]) & 1) != 0)
         visible = pieces[0] if parts == 1 else jnp.concatenate(pieces, axis=0)
-        visible &= logical + row[None, :] <= positions[:, None]
+        if "nomask" in ablate:  # bench-only: no bitset expansion
+            visible = jnp.ones((query_block, kv_tile), jnp.bool_)
+        if "nocausal" not in ablate:  # bench-only switch
+            visible &= logical + row[None, :] <= positions[:, None]
         written = logical + lax.broadcasted_iota(
             jnp.int32, (kv_tile, head_dim), 0
         ) < jnp.max(lengths_ref[:, 0])
@@ -349,8 +358,9 @@ def _kernel(
             if kv_ref.dtype == jnp.float8_e4m3fn:
                 key = key.astype(jnp.float32)
                 value = value.astype(jnp.float32)
-                key = jnp.where(jnp.isfinite(key) & written, key, 0)
-                value = jnp.where(jnp.isfinite(value) & written, value, 0)
+                if "nokvfix" not in ablate:  # bench-only switch
+                    key = jnp.where(jnp.isfinite(key) & written, key, 0)
+                    value = jnp.where(jnp.isfinite(value) & written, value, 0)
             else:
                 key = jnp.where(written, key, 0)
                 value = jnp.where(written, value, 0)
@@ -374,24 +384,35 @@ def _kernel(
                     query = q[head, :, start : start + query_tile].reshape(
                         rows, head_dim
                     )
-                score = lax.dot(
-                    query,
-                    key,
-                    dimension_numbers=(([1], [1]), ([], [])),
-                    preferred_element_type=jnp.float32,
-                )
+                if "noqk" in ablate:  # bench-only: no QK matmul
+                    score = jnp.zeros((rows, kv_tile), jnp.float32) + query[:, :1]
+                else:
+                    score = lax.dot(
+                        query,
+                        key,
+                        dimension_numbers=(([1], [1]), ([], [])),
+                        preferred_element_type=jnp.float32,
+                    )
                 row_visible = jnp.broadcast_to(
                     tile_visible[None, :, :],
                     (q_heads_per_kv, query_tile, kv_tile),
                 ).reshape(rows, kv_tile)
-                score = jnp.where(
-                    row_visible,
-                    score * score_scale if bf16_mxu else score,
-                    -jnp.inf,
-                )
+                if "nowhere" not in ablate:  # bench-only switch
+                    score = jnp.where(
+                        row_visible,
+                        score * score_scale if bf16_mxu else score,
+                        -jnp.inf,
+                    )
                 next_m = jnp.maximum(m, jnp.max(score, axis=1))
                 finite_m = jnp.where(jnp.isneginf(next_m), 0.0, next_m)
-                prob = jnp.exp(score - finite_m[:, None])
+                if "noexp" in ablate:  # bench-only: no exp
+                    prob = score - finite_m[:, None]
+                elif "bf16exp" in ablate:  # bench-only: BF16 exp
+                    prob = jnp.exp((score - finite_m[:, None]).astype(jnp.bfloat16)).astype(
+                        jnp.float32
+                    )
+                else:
+                    prob = jnp.exp(score - finite_m[:, None])
                 alpha = jnp.where(jnp.isneginf(next_m), 1.0, jnp.exp(m - next_m))
                 if bf16_mxu:
                     # Values are exact in BF16; split the FP32 probabilities
@@ -411,6 +432,8 @@ def _kernel(
                         dimension_numbers=(([1], [0]), ([], [])),
                         preferred_element_type=jnp.float32,
                     )
+                elif "nopv" in ablate:  # bench-only: no PV matmul
+                    weighted = jnp.zeros((rows, head_dim), jnp.float32) + prob[:, :1]
                 else:
                     weighted = lax.dot(
                         prob,
@@ -671,6 +694,7 @@ def block_sparse_gqa_prefill(
             **({"kv_head_offset": kv_head_offset} if kv_head_offset else {}),
             **({"bf16_mxu": True} if bf16_mxu else {}),
             query_tile=query_tile,
+            ablate=os.environ.get("QSA_PREFILL_ABLATE", ""),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
