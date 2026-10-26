@@ -413,6 +413,9 @@ def adaptive_fused_moe(
         )
     has_w1_bias = w1_bias is not None
     has_w2_bias = w2_bias is not None
+    from vllm_torchtpu import envs
+
+    pregathered = bool(envs.MOE_ADAPTIVE_PREGATHER)
     kfn = build_fused_ep_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -425,6 +428,7 @@ def adaptive_fused_moe(
         act_fn=act_fn,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        pregathered=pregathered,
     )
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -614,6 +618,14 @@ def adaptive_fused_moe(
         # HBM->SMEM DMA at the head of the kernel, and the prefetch also has to
         # fit in 1 MB of SMEM.
         kernel_tables = (*block_tables[:3], block_tables[5], row_tables[0])
+        if pregathered:
+            # MOE_ADAPTIVE_PREGATHER: this shard's slab rows in slab order, one
+            # gather here instead of one kernel DMA per row; padded by a tile
+            # so a tile's contiguous copy never runs past the end.
+            q_g = jnp.pad(
+                jnp.take(q_g, token_gather[:ragged_stride], axis=0),
+                ((0, capacity), (0, 0), (0, 0)),
+            )
         arrivals, arrival_scales = kfn(
             kernel_tables,
             token_gather,

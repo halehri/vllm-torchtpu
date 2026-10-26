@@ -119,6 +119,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
+    MOE_ADAPTIVE_PREGATHER: bool = False
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_ADAPTIVE_2D_CHANNEL_SCALES: bool = False
@@ -977,6 +978,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_KERNEL_MIN_TOKENS": lambda: int(
         os.getenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "1024")
     ),
+    # Adaptive fused EP MoE: gather this shard's slab rows from the
+    # all-gathered tokens once, outside the kernel, so the kernel fetches a
+    # tile's activations as one contiguous DMA instead of one DMA per row.
+    # The per-row descriptor issue is the kernel's critical path at prefill
+    # sizes (~10k rows per shard per layer at an 8192-token step).
+    "MOE_ADAPTIVE_PREGATHER": env_bool("MOE_ADAPTIVE_PREGATHER"),
     # Build each rank's two consumed routing-plan slices instead of
     # replicating the full T * topk * experts plan arithmetic on every rank.
     "MOE_FUSED_EP_V2_SHARDED_PLAN": env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),

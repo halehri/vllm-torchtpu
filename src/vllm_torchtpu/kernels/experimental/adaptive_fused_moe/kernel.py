@@ -524,8 +524,14 @@ def _build_fused_ep_moe_kernel(
     act_fn="silu",
     has_w1_bias=False,
     has_w2_bias=False,
+    pregathered=False,
 ):
-    """Build the pallas_call and the function that invokes it."""
+    """Build the pallas_call and the function that invokes it.
+
+    ``pregathered``: the token buffer operand already holds this shard's
+    slab rows in slab order (padded by a tile), so a tile's activations are
+    one contiguous DMA instead of one DMA per row by the token-gather table.
+    """
     if act_fn not in ACT_FNS:
         raise NotImplementedError(
             f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}"
@@ -959,6 +965,31 @@ def _build_fused_ep_moe_kernel(
         def lhs_issue_tile(row_base, live_blocks, slot, gather_slot, gather_offset):
             """Issue one tile's activations using a resident index window."""
 
+            if pregathered:
+                # Slab rows are contiguous: one copy for the whole tile.
+                # Rows past the live ones are never committed.
+                pltpu.make_async_copy(
+                    lhs_hbm.at[pl.ds(row_base, tile_m)],
+                    lhs_vm.at[slot],
+                    lhs_sems.at[slot],
+                ).start()
+            else:
+                issue_rows(live_blocks, slot, gather_slot, gather_offset)
+
+            if has_act_scale:
+                # ls rides along on the same sem. The slab is the dense
+                # lane-block view of one f32 per row, so a tile's window is
+                # the sublanes its rows fall in, not a row range.
+                assert ls_hbm is not None and ls_vm is not None
+                pltpu.make_async_copy(
+                    ls_hbm.at[pl.ds(row_base // HIDDEN_LANE_BLOCK, ls_window_rows)],
+                    ls_vm.at[slot],
+                    lhs_sems.at[slot],
+                ).start()
+
+        def issue_rows(live_blocks, slot, gather_slot, gather_offset):
+            """One DMA per token row, by the resident token-gather window."""
+
             def issue_from(gather_smem):
                 def issue_block(i, _):
                     """Fetch eight token rows of block i by their numbers."""
@@ -981,26 +1012,18 @@ def _build_fused_ep_moe_kernel(
             def _():
                 issue_from(token_gather_sm1)
 
-            if has_act_scale:
-                # ls rides along on the same sem. The slab is the dense
-                # lane-block view of one f32 per row, so a tile's window is
-                # the sublanes its rows fall in, not a row range.
-                assert ls_hbm is not None and ls_vm is not None
-                pltpu.make_async_copy(
-                    ls_hbm.at[pl.ds(row_base // HIDDEN_LANE_BLOCK, ls_window_rows)],
-                    ls_vm.at[slot],
-                    lhs_sems.at[slot],
-                ).start()
-
         def lhs_ready_tile(live_rows, slot):
             """Wait the token rows and the scale window of one tile."""
             # Sems count bytes, so the split wait is exact under any landing
             # order.
-            pltpu.make_async_copy(
-                lhs_vm.at[slot, pl.ds(0, live_rows)],
-                lhs_vm.at[slot, pl.ds(0, live_rows)],
-                lhs_sems.at[slot],
-            ).wait()
+            if pregathered:
+                pltpu.make_async_copy(lhs_vm.at[slot], lhs_vm.at[slot], lhs_sems.at[slot]).wait()
+            else:
+                pltpu.make_async_copy(
+                    lhs_vm.at[slot, pl.ds(0, live_rows)],
+                    lhs_vm.at[slot, pl.ds(0, live_rows)],
+                    lhs_sems.at[slot],
+                ).wait()
             if has_act_scale:
                 assert ls_vm is not None
                 pltpu.make_async_copy(
